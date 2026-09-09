@@ -204,6 +204,11 @@ impl<'w, W: Write> Emitter<'w, W> {
         self.gutters.iter().any(|g| g.kind == GutterKind::Code)
     }
 
+    /// Total display width of the active gutter prefixes.
+    fn gutter_width(&self) -> usize {
+        self.gutters.iter().map(|g| g.cont.width()).sum()
+    }
+
     /// Final style for inline content: dim inside blockquotes unless the
     /// inline context (code, link, emphasis, heading) already picked a color.
     fn text_style(&self, mut s: Style) -> Style {
@@ -453,9 +458,12 @@ impl<'w, W: Write> Emitter<'w, W> {
 
     fn rule(&mut self) {
         self.begin_line(true);
+        // With a width set the rule spans the whole available line (so it
+        // matches blocks like tables that fill it); without one it stays a
+        // modest 40 columns.
         let n = self
             .width
-            .map_or(40, |w| w.saturating_sub(self.line_start_col).min(40));
+            .map_or(40, |w| w.saturating_sub(self.gutter_width()));
         if n > 0 {
             let _ = self.write_run(&"─".repeat(n), Some(plain_style(C_BORDER)));
         }
@@ -589,16 +597,22 @@ impl<'w, W: Write> Emitter<'w, W> {
 
         // If a width is set, shrink columns so the whole table fits in it
         // (overhead: one border per column plus two cell-edge paddings, and a
-        // trailing border).
+        // leading border; gutter prefixes count against the budget too).
+        // Columns with content never shrink below 1: a 0-wide column would
+        // leave its content unwrapped and the row borders would no longer
+        // meet the separator's.
         if let Some(w) = self.width {
+            let gutter = self.gutter_width();
             let overhead = 3 * widths.len() + 1;
-            let budget = w.saturating_sub(overhead) as i64;
+            let budget = w
+                .saturating_sub(gutter)
+                .saturating_sub(overhead) as i64;
             let mut sum: i64 = widths.iter().map(|&x| x as i64).sum();
             while sum > budget {
                 let Some(mi) = widths
                     .iter()
                     .enumerate()
-                    .filter(|&(_, &x)| x > 0)
+                    .filter(|&(_, &x)| x > 1)
                     .max_by_key(|&(_, x)| x)
                     .map(|(i, _)| i)
                 else {
@@ -758,9 +772,10 @@ fn wrap_char_ranges(pc: &[char], first: usize, rest: usize) -> Vec<(usize, usize
 
 /// Split a styled (ANSI) line and its plain counterpart into chunks of at
 /// most `width` display columns, keeping each styled chunk aligned with its
-/// plain chunk.
+/// plain chunk. A zero width still wraps (one character per line) so the
+/// caller's borders never detach from an unwrapped line.
 fn wrap_pair(plain: &str, styled: &[u8], width: usize) -> Vec<(String, Vec<u8>)> {
-    if width == 0 || plain.width() <= width {
+    if plain.is_empty() || plain.width() <= width {
         return vec![(plain.to_string(), styled.to_vec())];
     }
     // For each visible char record: the SGR open that styles it (if any),
@@ -1413,8 +1428,64 @@ mod tests {
     }
 
     #[test]
-    fn width_shortens_rules() {
+    fn width_table_borders_stay_aligned() {
+        // When the budget cannot keep every column at width 1, shrinking
+        // stops at 1 per column instead of collapsing a column to 0: a
+        // 0-wide column would leave its content unwrapped and the row
+        // borders would no longer meet the separator's.
+        let md = "| aaaa | bbbb | cccc |\n|------|------|------|\n| 1111 | 2222 | 3333 |";
+        for w in [8usize, 12, 14, 20] {
+            let out = plain_w(md, w);
+            // Width-1 columns route every cell through wrap_pair's per-char
+            // SGR chunking when color is on; the stripped colored text must
+            // be identical to plain and keep the same uniform line widths.
+            let colored = String::from_utf8(render(md, true, Some(w))).expect("utf8 output");
+            assert_eq!(strip_ansi(&colored), out, "w={w}: colored differs from plain");
+            let is_table = |l: &str| l.contains('│') || l.contains('├');
+            let table: Vec<&str> = out.lines().filter(|l| is_table(l)).collect();
+            let ws: Vec<usize> = table.iter().map(|l| l.width()).collect();
+            assert_eq!(
+                ws.iter().all(|&x| x == ws[0]),
+                true,
+                "w={w}: misaligned table lines {ws:?}\n{out}"
+            );
+            for line in colored.lines() {
+                let s = strip_ansi(line);
+                if is_table(&s) {
+                    assert_eq!(s.width(), ws[0], "w={w}: colored line misaligned: {s:?}");
+                }
+            }
+            // A 3-column table needs 4 columns per column plus one leading
+            // border; below that it must overflow, but stay aligned.
+            if w >= 13 {
+                for line in &table {
+                    assert!(line.width() <= w, "w={w}: line too wide: {line:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn width_table_in_quote_fits_budget() {
+        // Gutter prefixes count against the width budget.
+        let md = "> | aaaa | bbbb |\n> |------|------|\n> | 1111 | 2222 |";
+        let out = plain_w(md, 13);
+        for line in out.lines() {
+            assert!(line.width() <= 13, "line too wide: {line:?}");
+        }
+    }
+
+    #[test]
+    fn width_rules_span_full_line() {
+        // With a width set the rule fills the available line; gutters count.
         assert_eq!(plain_w("---", 8), format!("{}\n", "─".repeat(8)));
+        assert_eq!(plain_w("---", 120), format!("{}\n", "─".repeat(120)));
+        assert_eq!(
+            plain_w("> ---", 10),
+            format!("> {}\n", "─".repeat(8))
+        );
+        // Without a width the rule stays a fixed 40 columns.
+        assert_eq!(plain("---"), format!("{}\n", "─".repeat(40)));
     }
 
     #[test]
