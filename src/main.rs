@@ -5,6 +5,8 @@
 //! Color policy: ANSI escapes are emitted when stdout is a TTY, unless
 //! `NO_COLOR` is set or `--no-color` is given; `--color` forces them on.
 
+//! Width: `--width N` wraps all output to at most N display columns.
+
 use std::env;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
@@ -12,7 +14,7 @@ use std::process::ExitCode;
 use pulldown_cmark::{
     Alignment, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ---------------------------------------------------------------------------
 // Palette (256-color indices)
@@ -83,7 +85,10 @@ impl Style {
 const RESET: &str = "\u{1b}[0m";
 
 fn plain_style(fg: u8) -> Style {
-    Style { fg: Some(fg), ..Default::default() }
+    Style {
+        fg: Some(fg),
+        ..Default::default()
+    }
 }
 
 fn heading_style(level: HeadingLevel) -> Style {
@@ -152,10 +157,19 @@ struct Emitter<'w, W: Write> {
     code_lang: Option<String>,
     /// A footnote-definition paragraph continues on its label line.
     after_label: bool,
+    /// Max display columns for wrapping; `None` = no wrapping.
+    width: Option<usize>,
+    /// Display column the next byte lands in (visible columns on the line).
+    col: usize,
+    /// Column at which the current line's content starts (after gutters).
+    line_start_col: usize,
+    /// Trailing spaces of the last run, held back until the line is known
+    /// to continue; dropped when it breaks.
+    pending_sp: usize,
 }
 
 impl<'w, W: Write> Emitter<'w, W> {
-    fn new(w: &'w mut W, color: bool, base_style: Style) -> Self {
+    fn new(w: &'w mut W, color: bool, base_style: Style, width: Option<usize>) -> Self {
         Self {
             w,
             color,
@@ -172,11 +186,18 @@ impl<'w, W: Write> Emitter<'w, W> {
             link_brackets: false,
             code_lang: None,
             after_label: false,
+            width,
+            col: 0,
+            line_start_col: 0,
+            pending_sp: 0,
         }
     }
 
     fn quote_depth(&self) -> usize {
-        self.gutters.iter().filter(|g| g.kind == GutterKind::Quote).count()
+        self.gutters
+            .iter()
+            .filter(|g| g.kind == GutterKind::Quote)
+            .count()
     }
 
     fn in_code_block(&self) -> bool {
@@ -213,6 +234,8 @@ impl<'w, W: Write> Emitter<'w, W> {
             let _ = self.w.write_all(b"\n");
             gap = self.top_gap;
             self.line_has_content = false;
+            self.col = 0;
+            self.pending_sp = 0;
         }
         self.top_gap = false;
         if gap {
@@ -233,13 +256,17 @@ impl<'w, W: Write> Emitter<'w, W> {
             let _ = self.w.write_all(b"\n");
             gap = self.top_gap;
             self.line_has_content = false;
+            self.col = 0;
+            self.pending_sp = 0;
         }
         self.top_gap = false;
         if gap {
             let _ = self.w.write_all(b"\n");
         }
         let skip_idx = if skip_code_gutter {
-            self.gutters.iter().rposition(|g| g.kind == GutterKind::Code)
+            self.gutters
+                .iter()
+                .rposition(|g| g.kind == GutterKind::Code)
         } else {
             None
         };
@@ -263,6 +290,7 @@ impl<'w, W: Write> Emitter<'w, W> {
         for (prefix, style) in prefixes {
             self.write_run(&prefix, style);
         }
+        self.line_start_col = self.line_width();
     }
 
     /// Write one run of `text`; `style` `None` means "unstyled".
@@ -270,17 +298,52 @@ impl<'w, W: Write> Emitter<'w, W> {
         if text.is_empty() {
             return;
         }
+        // Same line continues: release held-back spaces; new line drops them.
+        if self.line_has_content {
+            self.flush_spaces();
+        } else {
+            self.pending_sp = 0;
+        }
+        let mut off = text.len();
+        for (idx, c) in text.char_indices().rev() {
+            if !c.is_whitespace() {
+                break;
+            }
+            off = idx;
+        }
+        let trimmed = &text[..off];
+        self.pending_sp = text.chars().count() - trimmed.chars().count();
+        if trimmed.is_empty() {
+            self.line_has_content = true;
+            return;
+        }
         let s = style.unwrap_or_default();
         let open = s.sgr(self.color);
         if let Some(o) = &open {
             let _ = self.w.write_all(o.as_bytes());
         }
-        let _ = self.w.write_all(text.as_bytes());
+        let _ = self.w.write_all(trimmed.as_bytes());
         if open.is_some() {
             let _ = self.w.write_all(RESET.as_bytes());
         }
         self.line_has_content = true;
         self.block_content = true;
+        self.col += trimmed.width();
+    }
+
+    /// Write the held-back trailing spaces (the line continues).
+    fn flush_spaces(&mut self) {
+        if self.pending_sp == 0 {
+            return;
+        }
+        let _ = self.w.write_all(&b" ".repeat(self.pending_sp));
+        self.col += self.pending_sp;
+        self.pending_sp = 0;
+    }
+
+    /// Visible width already on the current line, held spaces included.
+    fn line_width(&self) -> usize {
+        self.col + self.pending_sp
     }
 
     /// Emit text with the current (or overridden) inline style, honoring the
@@ -305,7 +368,58 @@ impl<'w, W: Write> Emitter<'w, W> {
                 self.pending = false;
             }
             first = false;
-            let _ = self.write_run(seg, Some(s));
+            let _ = self.wrap(seg, Some(s));
+        }
+    }
+
+    /// Write `text` as one run, wrapping at word boundaries when a width is
+    /// set. A token longer than a full line is hard-broken characterwise.
+    fn wrap(&mut self, text: &str, style: Option<Style>) {
+        if text.is_empty() {
+            return;
+        }
+        let width = match self.width {
+            // Width that does not even fit the current gutters: leave alone.
+            Some(w) if w > self.line_start_col => w,
+            _ => {
+                self.write_run(text, style);
+                return;
+            }
+        };
+        if self.line_width().saturating_add(text.width()) <= width {
+            self.write_run(text, style);
+            return;
+        }
+        if self.line_width() >= width {
+            self.begin_line(false);
+        }
+        let first = width - self.line_width();
+        let rest = width - self.line_start_col;
+        let pc: Vec<char> = text.chars().collect();
+        // If the first token misses the line's remainder but fits on a
+        // fresh line, the wrap moves it there.
+        let mut k = 0usize;
+        while k < pc.len() && pc[k].is_whitespace() {
+            k += 1;
+        }
+        let mut j = k;
+        while j < pc.len() && !pc[j].is_whitespace() {
+            j += 1;
+        }
+        let tok = width_of(&pc[k..j]);
+        let first_moves = tok > first && tok <= rest;
+        let mut first_chunk = true;
+        for (a, b) in wrap_char_ranges(&pc, first, rest) {
+            if first_chunk {
+                if first_moves {
+                    self.begin_line(false);
+                }
+                first_chunk = false;
+            } else if self.line_width() > self.line_start_col {
+                self.begin_line(false);
+            }
+            let chunk: String = pc[a..b].iter().collect();
+            self.write_run(&chunk, style);
         }
     }
 
@@ -314,7 +428,7 @@ impl<'w, W: Write> Emitter<'w, W> {
         if let Some(lang) = self.code_lang.take() {
             if !lang.is_empty() {
                 self.begin_caption();
-                let _ = self.write_run(
+                let _ = self.wrap(
                     &lang,
                     Some(Style {
                         italic: true,
@@ -332,47 +446,46 @@ impl<'w, W: Write> Emitter<'w, W> {
                 continue; // trailing newline of the block
             }
             self.begin_line(true);
-            let _ = self.write_run(seg, Some(style));
+            let _ = self.wrap(seg, Some(style));
         }
         self.pending = true;
     }
 
     fn rule(&mut self) {
         self.begin_line(true);
-        let _ = self
-            .write_run(&"─".repeat(40), Some(plain_style(C_BORDER)));
+        let n = self
+            .width
+            .map_or(40, |w| w.saturating_sub(self.line_start_col).min(40));
+        if n > 0 {
+            let _ = self.write_run(&"─".repeat(n), Some(plain_style(C_BORDER)));
+        }
         self.pending = true;
     }
 
     /// Draw one table row (possibly multi-line cells) with padded columns.
     fn table_row(
         &mut self,
-        styled_row: &[Vec<Vec<u8>>],
-        plain_row: &[Vec<String>],
+        cells: &[Vec<(String, Vec<u8>)>],
         widths: &[usize],
         aligns: &[Alignment],
     ) {
-        let max_lines = plain_row.iter().map(|l| l.len()).max().unwrap_or(1);
+        let max_lines = cells.iter().map(|l| l.len()).max().unwrap_or(1);
         let empty: Vec<u8> = Vec::new();
         for line_idx in 0..max_lines {
             self.begin_line(true);
             self.write_run("│", Some(plain_style(C_BORDER)));
             for col in 0..widths.len() {
-                let width = widths[col];
-                let content = plain_row
-                    .get(col)
-                    .and_then(|lines| lines.get(line_idx))
-                    .map(String::as_str)
-                    .unwrap_or("");
-                let styled = styled_row
-                    .get(col)
-                    .and_then(|cell| cell.get(line_idx))
-                    .unwrap_or(&empty);
+                let (content, styled) = match cells.get(col).and_then(|lines| lines.get(line_idx)) {
+                    Some((p, s)) => (p.as_str(), s),
+                    None => ("", &empty),
+                };
                 let align = aligns.get(col).copied().unwrap_or(Alignment::None);
-                let (pre, post) = pad_info(content, width, align);
+                let (pre, post) = pad_info(content, widths[col], align);
                 self.write_run(&pre, None);
                 if !styled.is_empty() {
+                    self.flush_spaces();
                     let _ = self.w.write_all(styled);
+                    self.col += content.width();
                     self.line_has_content = true;
                     self.block_content = true;
                 }
@@ -421,56 +534,99 @@ impl<'w, W: Write> Emitter<'w, W> {
             return;
         }
 
-        // Render each cell twice: plain (to measure) and styled (to display).
-        let mut plain_cells: Vec<Vec<Vec<String>>> = Vec::with_capacity(rows.len());
-        let mut styled_cells: Vec<Vec<Vec<Vec<u8>>>> = Vec::with_capacity(rows.len());
+        // Render each cell twice: plain (to measure) and styled (to display),
+        // as parallel (plain, styled) line pairs.
+        let mut cells: Vec<Vec<Vec<(String, Vec<u8>)>>> = Vec::with_capacity(rows.len());
         for (r, row) in rows.iter().enumerate() {
             let base = if r == 0 {
-                Style { bold: true, fg: Some(C_HEADER), ..Default::default() }
+                Style {
+                    bold: true,
+                    fg: Some(C_HEADER),
+                    ..Default::default()
+                }
             } else {
                 Style::default()
             };
-            let mut pc = Vec::with_capacity(row.len());
-            let mut sc = Vec::with_capacity(row.len());
+            let mut cc = Vec::with_capacity(row.len());
             for cell in row {
                 let mut plain_buf: Vec<u8> = Vec::new();
                 {
-                    let mut em = Emitter::new(&mut plain_buf, false, base);
+                    let mut em = Emitter::new(&mut plain_buf, false, base, None);
                     for ev in cell {
                         handle_event(&mut em, ev);
                     }
                 }
                 let mut styled_buf: Vec<u8> = Vec::new();
                 {
-                    let mut em = Emitter::new(&mut styled_buf, self.color, base);
+                    let mut em = Emitter::new(&mut styled_buf, self.color, base, None);
                     for ev in cell {
                         handle_event(&mut em, ev);
                     }
                 }
                 let plain = String::from_utf8_lossy(&plain_buf).to_string();
                 let styled = styled_buf;
-                pc.push(plain.split('\n').map(str::to_owned).collect());
-                sc.push(styled.split(|&b| b == b'\n').map(<[u8]>::to_vec).collect());
+                let mut lines: Vec<(String, Vec<u8>)> = Vec::new();
+                for (pl, sl) in plain.split('\n').zip(styled.split(|&b| b == b'\n')) {
+                    lines.push((pl.to_string(), sl.to_vec()));
+                }
+                cc.push(lines);
             }
-            plain_cells.push(pc);
-            styled_cells.push(sc);
+            cells.push(cc);
         }
 
         // Column widths from the plain rendering.
         let mut widths = vec![0usize; rows[0].len()];
-        for pc in &plain_cells {
+        for pc in &cells {
             for (c, lines) in pc.iter().enumerate() {
                 if c >= widths.len() {
                     continue; // ragged row; ignore the extra cell
                 }
-                for line in lines {
+                for (line, _) in lines {
                     widths[c] = widths[c].max(line.width());
                 }
             }
         }
 
+        // If a width is set, shrink columns so the whole table fits in it
+        // (overhead: one border per column plus two cell-edge paddings, and a
+        // trailing border).
+        if let Some(w) = self.width {
+            let overhead = 3 * widths.len() + 1;
+            let budget = w.saturating_sub(overhead) as i64;
+            let mut sum: i64 = widths.iter().map(|&x| x as i64).sum();
+            while sum > budget {
+                let Some(mi) = widths
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &x)| x > 0)
+                    .max_by_key(|&(_, x)| x)
+                    .map(|(i, _)| i)
+                else {
+                    break;
+                };
+                widths[mi] -= 1;
+                sum -= 1;
+            }
+        }
+
+        // Wrap cell lines that are wider than their column.
+        for row in cells.iter_mut() {
+            for (c, lines) in row.iter_mut().enumerate() {
+                let cw = *widths.get(c).unwrap_or(&0);
+                let mut wrapped: Vec<(String, Vec<u8>)> = Vec::with_capacity(lines.len());
+                for (plain_line, styled_line) in std::mem::take(lines) {
+                    if plain_line.width() > cw {
+                        wrapped.extend(wrap_pair(&plain_line, &styled_line, cw));
+                    } else {
+                        wrapped.push((plain_line, styled_line));
+                    }
+                }
+                *lines = wrapped;
+            }
+        }
+
         for r in 0..rows.len() {
-            self.table_row(&styled_cells[r], &plain_cells[r], &widths, aligns);
+            self.table_row(&cells[r], &widths, aligns);
             if r == 0 {
                 // Header separator.
                 self.begin_line(true);
@@ -490,7 +646,6 @@ impl<'w, W: Write> Emitter<'w, W> {
     }
 }
 
-
 fn pad_info(text: &str, width: usize, align: Alignment) -> (String, String) {
     let w = text.width();
     let pad = width.saturating_sub(w);
@@ -500,6 +655,181 @@ fn pad_info(text: &str, width: usize, align: Alignment) -> (String, String) {
         Alignment::Center => (pad / 2, pad - pad / 2),
     };
     (" ".repeat(l + 1), " ".repeat(r + 1)) // 1 = cell edge padding
+}
+
+/// Total display width of a char slice.
+fn width_of(pc: &[char]) -> usize {
+    pc.iter().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// Greedily word-wrap `pc` into lines of at most `first` columns for the
+/// current line and `rest` columns for continuation lines. Returns exclusive
+/// `(start, end)` char-index pairs; tokens wider than the capacity are
+/// hard-broken.
+fn wrap_char_ranges(pc: &[char], first: usize, rest: usize) -> Vec<(usize, usize)> {
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut col = 0usize;
+    let mut cap = first;
+    let mut has = false;
+    let mut i = 0usize;
+    while i < pc.len() {
+        let ws = pc[i].is_whitespace();
+        let mut j = i;
+        while j < pc.len() && pc[j].is_whitespace() == ws {
+            j += 1;
+        }
+        if ws {
+            if has {
+                col += width_of(&pc[i..j]);
+            }
+            i = j;
+            continue;
+        }
+        let w = width_of(&pc[i..j]);
+        if has && col + w > cap {
+            let mut e = i;
+            while e > start && pc[e - 1].is_whitespace() {
+                e -= 1;
+            }
+            lines.push((start, e));
+            start = i;
+            col = 0;
+            cap = rest;
+        }
+        if !has && w > cap && w <= rest {
+            // First token misses the current line's remainder but fits on
+            // a fresh line: close the line and start there.
+            let mut e = i;
+            while e > start && pc[e - 1].is_whitespace() {
+                e -= 1;
+            }
+            if e > start {
+                lines.push((start, e));
+            }
+            start = i;
+            col = 0;
+            cap = rest;
+        }
+        if w > cap {
+            // Hard-break the token across lines.
+            let mut pos = i;
+            let mut c = 0usize;
+            while pos < j {
+                let cw = pc[pos].width().unwrap_or(0);
+                if c + cw > cap {
+                    if pos > start {
+                        lines.push((start, pos));
+                    }
+                    start = pos;
+                    c = 0;
+                    cap = rest;
+                }
+                if c + cw <= cap {
+                    c += cw;
+                    pos += 1;
+                } else {
+                    // Single char wider than a whole line: overflow it.
+                    lines.push((start, pos + 1));
+                    start = pos + 1;
+                    c = 0;
+                    cap = rest;
+                    pos += 1;
+                }
+            }
+            col = c;
+        } else {
+            col += w;
+        }
+        has = true;
+        i = j;
+    }
+    if has {
+        let mut e = pc.len();
+        while e > start && pc[e - 1].is_whitespace() {
+            e -= 1;
+        }
+        if e > start {
+            lines.push((start, e));
+        }
+    }
+    lines
+}
+
+/// Split a styled (ANSI) line and its plain counterpart into chunks of at
+/// most `width` display columns, keeping each styled chunk aligned with its
+/// plain chunk.
+fn wrap_pair(plain: &str, styled: &[u8], width: usize) -> Vec<(String, Vec<u8>)> {
+    if width == 0 || plain.width() <= width {
+        return vec![(plain.to_string(), styled.to_vec())];
+    }
+    // For each visible char record: the SGR open that styles it (if any),
+    // where the char's bytes start, and the end of the bytes that draw it
+    // (char + an immediately following reset, when present).
+    let mut sgr: Vec<Option<(usize, usize)>> = Vec::new();
+    let mut start_off: Vec<usize> = Vec::new();
+    let mut close: Vec<usize> = Vec::new();
+    let mut char_end: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    let mut cur: Option<(usize, usize)> = None;
+    while i < styled.len() {
+        if styled[i] == 0x1b && i + 2 < styled.len() && styled[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < styled.len() && !(styled[j] >= 0x40 && styled[j] <= 0x7e) {
+                j += 1;
+            }
+            let seq_end = if j < styled.len() { j + 1 } else { j };
+            let params = &styled[i + 2..j.min(styled.len())];
+            // Params "0" (or empty) is a reset; anything else opens a style.
+            if params.is_empty() || params == b"0" {
+                if let Some(last) = close.len().checked_sub(1) {
+                    close[last] = seq_end;
+                }
+                cur = None;
+            } else {
+                cur = Some((i, seq_end));
+            }
+            i = seq_end;
+            continue;
+        }
+        let rest = std::str::from_utf8(&styled[i..]).unwrap_or("");
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        let end = i + ch.len_utf8();
+        sgr.push(cur);
+        start_off.push(i);
+        close.push(end);
+        char_end.push(end);
+        i = end;
+    }
+    let pc: Vec<char> = plain.chars().collect();
+    if pc.len() != sgr.len() {
+        // Styled and plain renderings disagree; do not wrap.
+        return vec![(plain.to_string(), styled.to_vec())];
+    }
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    for (a, b) in wrap_char_ranges(&pc, width, width) {
+        let mut chunk: Vec<u8> = Vec::new();
+        let mut opened = false;
+        // A chunk starting mid-run re-emits its first char's SGR open.
+        if let Some((gs, ge)) = sgr[a] {
+            chunk.extend_from_slice(&styled[gs..ge]);
+            opened = true;
+        }
+        for c in a + 1..b {
+            opened |= sgr[c].is_some();
+        }
+        chunk.extend_from_slice(&styled[start_off[a]..close[b - 1]]);
+        // Close any style still open at the chunk's end so the chunk is
+        // self-contained.
+        if opened && close[b - 1] == char_end[b - 1] {
+            chunk.extend_from_slice(RESET.as_bytes());
+        }
+        let plain_chunk: String = pc[a..b].iter().collect();
+        out.push((plain_chunk, chunk));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -557,16 +887,15 @@ fn handle_event<W: Write>(em: &mut Emitter<W>, ev: &Event<'_>) {
                     em.ordered.push(start.map(|s| (s, s.to_string().len())));
                 }
                 Tag::Item => {
-                    let (first, cont) =
-                        match em.ordered.last_mut().and_then(|e| e.as_mut()) {
-                            Some((n, digits)) => {
-                                let d = *digits;
-                                let f = format!("{n}. ");
-                                *n += 1;
-                                (f, " ".repeat(d + 2))
-                            }
-                            None => ("• ".to_string(), "  ".to_string()),
-                        };
+                    let (first, cont) = match em.ordered.last_mut().and_then(|e| e.as_mut()) {
+                        Some((n, digits)) => {
+                            let d = *digits;
+                            let f = format!("{n}. ");
+                            *n += 1;
+                            (f, " ".repeat(d + 2))
+                        }
+                        None => ("• ".to_string(), "  ".to_string()),
+                    };
                     em.gutters.push(Gutter {
                         kind: GutterKind::Item,
                         first,
@@ -581,16 +910,13 @@ fn handle_event<W: Write>(em: &mut Emitter<W>, ev: &Event<'_>) {
                         em.begin_line(true);
                         em.pending = false;
                     }
-                    let _ = em
-                        .write_run(&format!("[^{label}]: "), Some(plain_style(C_DIM)));
+                    let _ = em.wrap(&format!("[^{label}]: "), Some(plain_style(C_DIM)));
                     em.after_label = true;
                 }
                 Tag::MetadataBlock(_) => {
                     em.pending = true;
                 }
-                Tag::DefinitionList
-                | Tag::DefinitionListTitle
-                | Tag::DefinitionListDefinition => {}
+                Tag::DefinitionList | Tag::DefinitionListTitle | Tag::DefinitionListDefinition => {}
                 Tag::Table(_) => {} // batched by the caller
                 Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
                 // ---- inline spans ----
@@ -616,15 +942,18 @@ fn handle_event<W: Write>(em: &mut Emitter<W>, ev: &Event<'_>) {
                 Tag::Superscript | Tag::Subscript => {
                     em.push_style();
                 }
-                Tag::Link { link_type, dest_url, .. } => {
+                Tag::Link {
+                    link_type,
+                    dest_url,
+                    ..
+                } => {
                     em.push_style();
                     em.style.underline = true;
                     if em.style.fg.is_none() {
                         em.style.fg = Some(C_LINK);
                     }
                     em.link_url = dest_url.to_string();
-                    em.link_brackets =
-                        !matches!(link_type, LinkType::Autolink | LinkType::Email);
+                    em.link_brackets = !matches!(link_type, LinkType::Autolink | LinkType::Email);
                     if em.link_brackets {
                         if em.pending {
                             em.begin_line(true);
@@ -692,7 +1021,7 @@ fn handle_event<W: Write>(em: &mut Emitter<W>, ev: &Event<'_>) {
                         let _ = em.write_run("]", Some(plain_style(C_DIM)));
                         if !url.is_empty() {
                             let _ = em.write_run("(", Some(plain_style(C_DIM)));
-                            let _ = em.write_run(&url, Some(plain_style(C_DIM)));
+                            let _ = em.wrap(&url, Some(plain_style(C_DIM)));
                             let _ = em.write_run(")", Some(plain_style(C_BORDER)));
                         }
                     }
@@ -713,12 +1042,15 @@ fn handle_event<W: Write>(em: &mut Emitter<W>, ev: &Event<'_>) {
             if em.in_code_block() {
                 em.emit_code(t.as_ref());
             } else {
-                let _ = em
-                    .emit_text(t.as_ref(), Some(plain_style(C_CODE)));
+                let _ = em.emit_text(t.as_ref(), Some(plain_style(C_CODE)));
             }
         }
         Event::InlineMath(t) | Event::DisplayMath(t) => {
-            let s = Style { italic: true, fg: Some(C_MATH), ..Default::default() };
+            let s = Style {
+                italic: true,
+                fg: Some(C_MATH),
+                ..Default::default()
+            };
             if matches!(ev, Event::DisplayMath(_)) {
                 em.begin_line(true);
             }
@@ -733,17 +1065,16 @@ fn handle_event<W: Write>(em: &mut Emitter<W>, ev: &Event<'_>) {
                 em.begin_line(true);
                 em.pending = false;
             }
-            let _ = em.write_run(t.as_ref(), Some(plain_style(C_DIM)));
+            let _ = em.wrap(t.as_ref(), Some(plain_style(C_DIM)));
         }
         Event::FootnoteReference(label) => {
-            let _ =
-                em.emit_text(&format!("[^{label}]"), Some(plain_style(C_ITALIC)));
+            let _ = em.emit_text(&format!("[^{label}]"), Some(plain_style(C_ITALIC)));
         }
         Event::TaskListMarker(checked) => {
-            let _ = em
-                .emit_text(if *checked { "[x] " } else { "[ ] " }, Some(plain_style(
-                    if *checked { C_BULLET } else { C_DIM },
-                )));
+            let _ = em.emit_text(
+                if *checked { "[x] " } else { "[ ] " },
+                Some(plain_style(if *checked { C_BULLET } else { C_DIM })),
+            );
         }
         Event::SoftBreak | Event::HardBreak => {
             em.begin_line(true);
@@ -756,7 +1087,7 @@ fn handle_event<W: Write>(em: &mut Emitter<W>, ev: &Event<'_>) {
 // Top-level rendering
 // ---------------------------------------------------------------------------
 
-fn render(md: &str, color: bool) -> Vec<u8> {
+fn render(md: &str, color: bool, width: Option<usize>) -> Vec<u8> {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_STRIKETHROUGH
@@ -764,7 +1095,7 @@ fn render(md: &str, color: bool) -> Vec<u8> {
         | Options::ENABLE_MATH;
     let mut iter = Parser::new_ext(md, options);
     let mut buf: Vec<u8> = Vec::new();
-    let mut em = Emitter::new(&mut buf, color, Style::default());
+    let mut em = Emitter::new(&mut buf, color, Style::default(), width);
 
     while let Some(ev) = iter.next() {
         if let Event::Start(Tag::Table(aligns)) = &ev {
@@ -813,17 +1144,30 @@ Options:
   --color[=WHEN]   Force colors. WHEN: always (default for this flag),
                    never, auto (TTY + no NO_COLOR)
   --no-color       Disable ANSI colors (same as --color=never)
+  -w, --width N    Wrap output at N display columns; no wrapping by default
   -h, --help       Show this help
   -V, --version    Show version
 ";
 
+fn parse_width(v: &str) -> Option<usize> {
+    match v.parse::<usize>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => {
+            eprintln!("mdhl: invalid --width value: {v} (expected a positive integer)");
+            None
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let mut color: Option<bool> = None;
+    let mut width: Option<usize> = None;
     let mut file: Option<String> = None;
 
-    for arg in &args {
-        let a = arg.as_str();
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
         match a {
             "-h" | "--help" => {
                 print!("{HELP}");
@@ -841,10 +1185,38 @@ fn main() -> ExitCode {
                     "never" => Some(false),
                     "auto" => None,
                     other => {
-                        eprintln!("mdhl: invalid --color value: {other} (expected always, never, or auto)");
+                        eprintln!(
+                            "mdhl: invalid --color value: {other} (expected always, never, or auto)"
+                        );
                         return ExitCode::from(2);
                     }
                 };
+            }
+            "--width" | "-w" => {
+                i += 1;
+                let v = match args.get(i) {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("mdhl: --width requires a value");
+                        return ExitCode::from(2);
+                    }
+                };
+                let Some(n) = parse_width(v) else {
+                    return ExitCode::from(2);
+                };
+                width = Some(n);
+            }
+            s if s.starts_with("--width=") => {
+                let Some(n) = parse_width(&s["--width=".len()..]) else {
+                    return ExitCode::from(2);
+                };
+                width = Some(n);
+            }
+            s if s.len() > 2 && s.starts_with("-w") => {
+                let Some(n) = parse_width(&a[2..]) else {
+                    return ExitCode::from(2);
+                };
+                width = Some(n);
             }
             s if s.starts_with('-') && s != "-" => {
                 eprintln!("mdhl: unknown option: {a}");
@@ -859,11 +1231,11 @@ fn main() -> ExitCode {
                 file = Some(a.to_string());
             }
         }
+        i += 1;
     }
 
-    let color = color.unwrap_or_else(|| {
-        io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
-    });
+    let color =
+        color.unwrap_or_else(|| io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none());
 
     let input = match &file {
         Some(path) => match std::fs::read_to_string(path) {
@@ -883,7 +1255,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let out = render(&input, color);
+    let out = render(&input, color, width);
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     if let Err(e) = handle.write_all(&out) {
@@ -905,9 +1277,32 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::render;
+    use unicode_width::UnicodeWidthStr;
 
     fn plain(md: &str) -> String {
-        String::from_utf8(render(md, false)).expect("utf8 output")
+        String::from_utf8(render(md, false, None)).expect("utf8 output")
+    }
+
+    fn plain_w(md: &str, width: usize) -> String {
+        String::from_utf8(render(md, false, Some(width))).expect("utf8 output")
+    }
+
+    /// Remove SGR escape sequences so colored output can be compared as text.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut skip = 0usize;
+        for c in s.chars() {
+            if skip > 0 {
+                if c == 'm' {
+                    skip = 0;
+                }
+            } else if c == '\u{1b}' {
+                skip = 1;
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     #[test]
@@ -960,11 +1355,72 @@ mod tests {
 
     #[test]
     fn color_toggle() {
-        let off = render("x **y**", false);
+        let off = render("x **y**", false, None);
         assert!(!off.contains(&0x1b));
-        let on = render("x **y**", true);
+        let on = render("x **y**", true, None);
         let open = b"\x1b[1;38;5;220m";
         assert!(on.windows(open.len()).any(|w| w == open));
         assert!(on.ends_with(b"\n".as_slice()));
+    }
+
+    #[test]
+    fn width_wraps_paragraphs() {
+        assert_eq!(
+            plain_w("hello world this is a test", 10),
+            "hello\nworld this\nis a test\n"
+        );
+        assert_eq!(plain_w("hello world", 40), "hello world\n");
+    }
+
+    #[test]
+    fn width_moves_whole_tokens() {
+        // A token that misses the line's remainder but fits on a fresh line
+        // moves whole instead of being hard-broken.
+        assert_eq!(
+            plain_w("x y z [a](http://x.y)", 12),
+            "x y z [a](\nhttp://x.y)\n"
+        );
+    }
+
+    #[test]
+    fn width_wraps_quotes_and_code() {
+        assert_eq!(plain_w("> hello world foo", 9), "> hello\n  world\n  foo\n");
+        assert_eq!(plain_w("```\nabcdefghij\n```", 6), "│ abcd\n│ efgh\n│ ij\n");
+    }
+
+    #[test]
+    fn width_shrinks_tables() {
+        let md = "| aaaa | bbbb |\n|------|------|\n| 1111 | 2222 |";
+        let out = plain_w(md, 12);
+        for line in out.lines() {
+            assert!(line.width() <= 12, "line too wide: {line:?}");
+        }
+        assert!(out.starts_with("│ aaa │ bb │\n│ a   │ bb │\n├─────┼────┤\n"));
+    }
+
+    #[test]
+    fn width_keeps_colored_tables_aligned() {
+        let md = "| aaaa | bbbb |\n|------|------|\n| 1111 | 2222 |";
+        let plain = plain_w(md, 12);
+        let on = render(md, true, Some(12));
+        let colored = String::from_utf8(on).expect("utf8 output");
+        assert!(colored.contains('\u{1b}'));
+        assert_eq!(strip_ansi(&colored), plain);
+        for line in colored.lines() {
+            let w = strip_ansi(line).width();
+            assert!(w <= 12, "line too wide: {line:?}");
+        }
+    }
+
+    #[test]
+    fn width_shortens_rules() {
+        assert_eq!(plain_w("---", 8), format!("{}\n", "─".repeat(8)));
+    }
+
+    #[test]
+    fn width_parsing_rejects_bad_values() {
+        assert_eq!(super::parse_width("40").unwrap(), 40);
+        assert!(super::parse_width("0").is_none());
+        assert!(super::parse_width("abc").is_none());
     }
 }
