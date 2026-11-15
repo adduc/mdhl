@@ -1219,7 +1219,9 @@ Options:
 Config: default options are read from the first of $MDHL_CONFIG,
 $XDG_CONFIG_HOME/mdhl/config (~/.config/mdhl/config), /etc/mdhl/config
 that exists. It holds options as on the command line, whitespace- or
-line-separated; `#` starts a comment line. Command-line options win.
+line-separated (no quoting); a word starting with `#` starts a comment.
+Command-line options win over the same option in the config; -w doesn't
+change a configured --table-width or --code-width.
 ";
 
 /// System-wide config, used when no user config exists.
@@ -2022,7 +2024,9 @@ mod tests {
         let o = merged(cfg, "-w 60 --color=never doc.md");
         assert_eq!(o.color, Some(false));
         assert_eq!(o.widths.all, Some(60));
+        // Intended: a CLI --width doesn't reset configured table/code widths.
         assert_eq!(o.widths.table(), Some(120));
+        assert_eq!(o.widths.code(), Some(120));
         assert_eq!(o.file.as_deref(), Some("doc.md"));
 
         // --color=auto resets a forced color back to auto-detection.

@@ -113,8 +113,10 @@ Default options are read from the first of these files that exists:
 2. `$XDG_CONFIG_HOME/mdhl/config` (default `~/.config/mdhl/config`)
 3. `/etc/mdhl/config` — system-wide fallback
 
-The file holds options exactly as on the command line, separated by
-whitespace or newlines. Lines starting with `#` are comments.
+The file holds options as on the command line, separated by whitespace or
+newlines. There is no shell quoting: values can't contain spaces. A word
+starting with `#` begins a comment that runs to the end of the line, so
+both whole-line and trailing comments work (`-w 80  # wrap prose`).
 
 ```text
 # ~/.config/mdhl/config
@@ -124,16 +126,23 @@ whitespace or newlines. Lines starting with `#` are comments.
 --color
 ```
 
-Command-line options are applied after the config, so they win:
-`--width 60` replaces the configured width, `--no-width` /
-`--no-table-width` / `--no-code-width` remove a configured limit, and
-`--color=auto` / `--no-color` undo a configured `--color`. `--no-config`
-skips the file entirely.
+Command-line options are applied after the config, so each one wins over
+the same option in the config: `--width 60` replaces the configured width,
+`--no-width` / `--no-table-width` / `--no-code-width` remove a configured
+limit, and `--color=auto` / `--no-color` undo a configured `--color`.
+`--no-config` skips the file entirely.
+
+`--width` only replaces `--width`. A `--table-width` or `--code-width` set
+in the config still applies, so with the config above, `mdhl -w 60 doc.md`
+wraps prose at 60 but keeps tables and code at 120. Pass `--table-width` /
+`--code-width` (or `--no-table-width` / `--no-code-width`) on the command
+line to change those too.
 
 A config may only set options: `FILE`, `--help`, `--version`, and
 `--no-config` are rejected. A config file that is unreadable or contains an
-invalid option is an error (exit `2`) naming the file. A missing file is
-skipped, except for an explicit `$MDHL_CONFIG`. Command-line errors and
+invalid option is an error (exit `2`) naming the file. A missing file, or
+a path that is a directory or runs through a regular file, is skipped (as is
+an unreadable `/etc/mdhl/config`), except for an explicit `$MDHL_CONFIG`. Command-line errors and
 `--help` are reported before the config is read, so a broken config
 never hides them.
 
