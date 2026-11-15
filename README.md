@@ -139,10 +139,12 @@ wraps prose at 60 but keeps tables and code at 120. Pass `--table-width` /
 line to change those too.
 
 A config may only set options: `FILE`, `--help`, `--version`, and
-`--no-config` are rejected. A config file that is unreadable or contains an
-invalid option is an error (exit `2`) naming the file. A missing file, or
-a path that is a directory or runs through a regular file, is skipped (as is
-an unreadable `/etc/mdhl/config`), except for an explicit `$MDHL_CONFIG`. Command-line errors and
+`--no-config` are rejected. A missing config file is silently skipped. Any
+other problem with one of the default files — it can't be read, isn't a
+regular file, or contains an invalid option — prints a warning naming the
+file, and that file is ignored (the next one in the list is tried). An
+explicit `$MDHL_CONFIG` is stricter: any such problem, including a missing
+file, is an error (exit `2`). Command-line errors and
 `--help` are reported before the config is read, so a broken config
 never hides them.
 

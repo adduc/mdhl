@@ -1465,30 +1465,42 @@ fn config_args(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether a read error on an optional (searched-for) config path means
-/// "no config here" rather than a broken config. A stray file or folder
-/// in the way, or a system config the user can't read, shouldn't stop
-/// every run; an explicit `$MDHL_CONFIG` never gets here.
-fn skippable_config_error(path: &std::path::Path, kind: io::ErrorKind) -> bool {
-    use io::ErrorKind::*;
-    match kind {
-        NotFound | NotADirectory | IsADirectory => true,
-        PermissionDenied => path == std::path::Path::new(SYSTEM_CONFIG),
-        _ => false,
-    }
-}
-
-/// Read the first existing config file: its path and arguments, or
-/// `None` if there is none.
-fn load_config(search: &ConfigSearch) -> Result<Option<(PathBuf, Vec<String>)>, String> {
+/// Read and parse the first usable config file, returning its settings
+/// (empty if there is none). A missing file is silently skipped. For the
+/// searched-for default paths, any other problem (unreadable, not a regular
+/// file, invalid options) is reported through `warn` and that file is
+/// skipped too, so a stray or broken default config never stops a run. An
+/// explicit `$MDHL_CONFIG` (`required`) is an error instead.
+fn load_config(
+    search: &ConfigSearch,
+    warn: &mut dyn FnMut(String),
+) -> Result<Vec<Setting>, String> {
+    let mut problem = |msg: String| {
+        if search.required {
+            Err(msg)
+        } else {
+            warn(msg);
+            Ok(())
+        }
+    };
     for path in &search.paths {
-        match std::fs::read_to_string(path) {
-            Ok(text) => return Ok(Some((path.clone(), config_args(&text)))),
-            Err(e) if !search.required && skippable_config_error(path, e.kind()) => continue,
-            Err(e) => return Err(format!("cannot read config {}: {e}", path.display())),
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if !search.required && e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                problem(format!("cannot read config {}: {e}", path.display()))?;
+                continue;
+            }
+        };
+        match parse_args(&config_args(&text), false) {
+            Ok(Flow::Run(settings)) => return Ok(settings),
+            Ok(Flow::Help | Flow::Version) => {
+                unreachable!("parse_args rejects --help/--version in a config")
+            }
+            Err(e) => problem(format!("{}: {}", path.display(), e.msg))?,
         }
     }
-    Ok(None)
+    Ok(Vec::new())
 }
 
 fn main() -> ExitCode {
@@ -1518,18 +1530,9 @@ fn main() -> ExitCode {
     // Config first, then the command line on top of it.
     let mut opts = Opts::default();
     if !cli.contains(&Setting::NoConfig) {
-        match load_config(&config_search(|k| env::var_os(k))) {
-            Ok(None) => {}
-            Ok(Some((path, config))) => match parse_args(&config, false) {
-                Ok(Flow::Run(settings)) => opts.apply(&settings),
-                Ok(Flow::Help | Flow::Version) => {
-                    unreachable!("parse_args rejects --help/--version in a config")
-                }
-                Err(e) => {
-                    eprintln!("mdhl: {}: {}", path.display(), e.msg);
-                    return ExitCode::from(2);
-                }
-            },
+        let mut warn = |msg: String| eprintln!("mdhl: warning: {msg} (ignored)");
+        match load_config(&config_search(|k| env::var_os(k)), &mut warn) {
+            Ok(settings) => opts.apply(&settings),
             Err(msg) => {
                 eprintln!("mdhl: {msg}");
                 return ExitCode::from(2);
@@ -2049,26 +2052,46 @@ mod tests {
     }
 
     #[test]
-    fn optional_config_skips_paths_that_are_not_files() {
-        use super::{ConfigSearch, load_config};
+    fn optional_config_problems_warn_and_skip() {
+        use super::{ConfigSearch, Flow, load_config, parse_args};
         let dir = std::env::temp_dir().join(format!("mdhl-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("isdir")).unwrap();
         std::fs::write(dir.join("file"), "").unwrap();
+        std::fs::write(dir.join("bad"), "--bogus\n").unwrap();
         std::fs::write(dir.join("real"), "-w 70\n").unwrap();
-        let search = |required| ConfigSearch {
-            paths: vec![
-                dir.join("missing"),
-                dir.join("file").join("config"), // parent is a file: NotADirectory
-                dir.join("isdir"),               // IsADirectory
-                dir.join("real"),
-            ],
+        let search = |paths: &[&str], required| ConfigSearch {
+            paths: paths.iter().map(|p| dir.join(p)).collect(),
             required,
         };
-        let found = load_config(&search(false)).expect("optional paths are skipped");
-        assert_eq!(found, Some((dir.join("real"), args("-w 70"))));
-        // An explicit config path still fails loudly.
-        assert!(load_config(&search(true)).is_err());
+        let all = [
+            "missing",     // NotFound: skipped silently
+            "file/config", // parent is a file
+            "isdir",       // a directory (PermissionDenied on Windows)
+            "bad",         // invalid option
+            "real",
+        ];
+        let mut warnings = Vec::new();
+        let found = load_config(&search(&all, false), &mut |m| warnings.push(m))
+            .expect("optional paths never fail");
+        let Ok(Flow::Run(expected)) = parse_args(&args("-w 70"), false) else {
+            panic!("-w 70 should parse")
+        };
+        assert_eq!(found, expected);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[2].contains("--bogus"), "{warnings:?}");
+
+        // Nothing usable: no settings, and a missing file isn't worth a warning.
+        let mut warnings = Vec::new();
+        let found = load_config(&search(&["missing"], false), &mut |m| warnings.push(m));
+        assert_eq!(found, Ok(Vec::new()));
+        assert!(warnings.is_empty());
+
+        // An explicit config path fails loudly, whatever is wrong with it.
+        for p in ["missing", "isdir", "bad"] {
+            let r = load_config(&search(&[p], true), &mut |m| panic!("warned: {m}"));
+            assert!(r.is_err(), "{p}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
