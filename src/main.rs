@@ -1114,35 +1114,58 @@ fn handle_event<W: Write>(em: &mut Emitter<W>, ev: &Event<'_>) {
 // Top-level rendering
 // ---------------------------------------------------------------------------
 
+/// A width limit that can fall back to `--width`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Limit {
+    /// Not set: follow `--width`.
+    #[default]
+    Inherit,
+    /// `--no-…-width`: no limit, whatever `--width` is.
+    Unlimited,
+    /// `--…-width N`.
+    Cols(usize),
+}
+
+impl Limit {
+    /// The effective limit, given the `--width` limit to inherit.
+    fn or(self, all: Option<usize>) -> Option<usize> {
+        match self {
+            Limit::Inherit => all,
+            Limit::Unlimited => None,
+            Limit::Cols(n) => Some(n),
+        }
+    }
+}
+
 /// Output width limits, in display columns; `None` = no limit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Widths {
     /// Everything (`--width`).
     all: Option<usize>,
-    /// Tables (`--table-width`): `None` falls back to `all`; `Some(None)`
-    /// (`--no-table-width`) means unlimited regardless of `all`.
-    table: Option<Option<usize>>,
-    /// Code blocks (`--code-width`), with the same fallback as `table`.
-    code: Option<Option<usize>>,
+    /// Tables (`--table-width`).
+    table: Limit,
+    /// Code blocks (`--code-width`).
+    code: Limit,
 }
 
 impl Widths {
     /// Effective table budget: `--table-width`, else `--width`.
     fn table(&self) -> Option<usize> {
-        self.table.unwrap_or(self.all)
+        self.table.or(self.all)
     }
 
     /// Effective code-block wrap width: `--code-width`, else `--width`.
     fn code(&self) -> Option<usize> {
-        self.code.unwrap_or(self.all)
+        self.code.or(self.all)
     }
 
     /// Set the limit for a width option (by canonical name); `None` is the
     /// `--no-…` form.
     fn set(&mut self, flag: &str, limit: Option<usize>) {
+        let as_limit = limit.map_or(Limit::Unlimited, Limit::Cols);
         match flag {
-            "--table-width" => self.table = Some(limit),
-            "--code-width" => self.code = Some(limit),
+            "--table-width" => self.table = as_limit,
+            "--code-width" => self.code = as_limit,
             _ => self.all = limit,
         }
     }
@@ -1264,6 +1287,17 @@ fn no_width_flag(a: &str) -> Option<&'static str> {
     }
 }
 
+/// One option from the config file or the command line, as parsed.
+#[derive(Debug, PartialEq, Eq)]
+enum Setting {
+    /// `None` = auto.
+    Color(Option<bool>),
+    /// A width option by canonical name; `None` is the `--no-…` form.
+    Width(&'static str, Option<usize>),
+    File(String),
+    NoConfig,
+}
+
 /// Settings gathered from the config file and the command line.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Opts {
@@ -1274,10 +1308,25 @@ struct Opts {
     no_config: bool,
 }
 
+impl Opts {
+    /// Apply parsed settings in order, later ones overriding earlier ones.
+    fn apply(&mut self, settings: &[Setting]) {
+        for setting in settings {
+            match setting {
+                Setting::Color(c) => self.color = *c,
+                Setting::Width(flag, limit) => self.widths.set(flag, *limit),
+                Setting::File(f) => self.file = Some(f.clone()),
+                Setting::NoConfig => self.no_config = true,
+            }
+        }
+    }
+}
+
 /// What `main` should do once arguments are parsed.
 #[derive(Debug, PartialEq, Eq)]
 enum Flow {
-    Run,
+    /// Render, with these settings in argument order.
+    Run(Vec<Setting>),
     Help,
     Version,
 }
@@ -1298,10 +1347,13 @@ impl From<String> for ArgError {
     }
 }
 
-/// Apply `args` to `opts`, later options overriding earlier ones.
+/// Parse `args` into settings, without applying them, so the config's and
+/// the command line's are each validated once and then layered in `main`.
 /// `cli` is false for config-file arguments, which may only set option
 /// defaults: no FILE, `--help`, `--version`, or `--no-config`.
-fn parse_args(args: &[String], opts: &mut Opts, cli: bool) -> Result<Flow, ArgError> {
+fn parse_args(args: &[String], cli: bool) -> Result<Flow, ArgError> {
+    let mut settings = Vec::new();
+    let mut have_file = false;
     let mut i = 0usize;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1311,11 +1363,11 @@ fn parse_args(args: &[String], opts: &mut Opts, cli: bool) -> Result<Flow, ArgEr
             }
             "-h" | "--help" => return Ok(Flow::Help),
             "-V" | "--version" => return Ok(Flow::Version),
-            "--no-config" => opts.no_config = true,
-            "--no-color" => opts.color = Some(false),
-            "--color" => opts.color = Some(true),
+            "--no-config" => settings.push(Setting::NoConfig),
+            "--no-color" => settings.push(Setting::Color(Some(false))),
+            "--color" => settings.push(Setting::Color(Some(true))),
             s if s.starts_with("--color=") => {
-                opts.color = match &s["--color=".len()..] {
+                let color = match &s["--color=".len()..] {
                     "always" => Some(true),
                     "never" => Some(false),
                     "auto" => None,
@@ -1326,8 +1378,9 @@ fn parse_args(args: &[String], opts: &mut Opts, cli: bool) -> Result<Flow, ArgEr
                         .into());
                     }
                 };
+                settings.push(Setting::Color(color));
             }
-            _ if let Some(flag) = no_width_flag(a) => opts.widths.set(flag, None),
+            _ if let Some(flag) = no_width_flag(a) => settings.push(Setting::Width(flag, None)),
             _ if let Some((flag, inline)) = width_flag(a) => {
                 let v = match inline {
                     Some(v) => v,
@@ -1339,7 +1392,7 @@ fn parse_args(args: &[String], opts: &mut Opts, cli: bool) -> Result<Flow, ArgEr
                         }
                     }
                 };
-                opts.widths.set(flag, Some(parse_width(flag, v)?));
+                settings.push(Setting::Width(flag, Some(parse_width(flag, v)?)));
             }
             s if s.starts_with('-') && s != "-" => {
                 return Err(ArgError {
@@ -1354,15 +1407,16 @@ fn parse_args(args: &[String], opts: &mut Opts, cli: bool) -> Result<Flow, ArgEr
                 .into());
             }
             _ => {
-                if opts.file.is_some() {
+                if have_file {
                     return Err(format!("unexpected argument: {a}").into());
                 }
-                opts.file = Some(a.to_string());
+                have_file = true;
+                settings.push(Setting::File(a.to_string()));
             }
         }
         i += 1;
     }
-    Ok(Flow::Run)
+    Ok(Flow::Run(settings))
 }
 
 /// Config files to try, in order; the first that exists is used. When
@@ -1442,9 +1496,8 @@ fn main() -> ExitCode {
 
     // The command line is validated on its own first, so `--help` and
     // usage errors never depend on the config file.
-    let mut opts = Opts::default();
-    match parse_args(&args, &mut opts, true) {
-        Ok(Flow::Run) => {}
+    let cli = match parse_args(&args, true) {
+        Ok(Flow::Run(settings)) => settings,
         Ok(Flow::Help) => {
             print!("{HELP}");
             return ExitCode::SUCCESS;
@@ -1460,27 +1513,30 @@ fn main() -> ExitCode {
             }
             return ExitCode::from(2);
         }
-    }
+    };
 
-    if !opts.no_config {
+    // Config first, then the command line on top of it.
+    let mut opts = Opts::default();
+    if !cli.contains(&Setting::NoConfig) {
         match load_config(&config_search(|k| env::var_os(k))) {
             Ok(None) => {}
-            Ok(Some((path, config))) => {
-                // Config first, then the command line on top of it.
-                let mut merged = Opts::default();
-                if let Err(e) = parse_args(&config, &mut merged, false) {
+            Ok(Some((path, config))) => match parse_args(&config, false) {
+                Ok(Flow::Run(settings)) => opts.apply(&settings),
+                Ok(Flow::Help | Flow::Version) => {
+                    unreachable!("parse_args rejects --help/--version in a config")
+                }
+                Err(e) => {
                     eprintln!("mdhl: {}: {}", path.display(), e.msg);
                     return ExitCode::from(2);
                 }
-                parse_args(&args, &mut merged, true).expect("command line already validated");
-                opts = merged;
-            }
+            },
             Err(msg) => {
                 eprintln!("mdhl: {msg}");
                 return ExitCode::from(2);
             }
         }
     }
+    opts.apply(&cli);
 
     let color = opts
         .color
@@ -1525,7 +1581,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Widths, render};
+    use super::{Limit, Widths, render};
     use unicode_width::UnicodeWidthStr;
 
     fn plain(md: &str) -> String {
@@ -1756,11 +1812,11 @@ mod tests {
                     ..Default::default()
                 },
                 2 => Widths {
-                    table: Some(Some(2)),
+                    table: Limit::Cols(2),
                     ..Default::default()
                 },
                 _ => Widths {
-                    code: Some(Some(3)),
+                    code: Limit::Cols(3),
                     ..Default::default()
                 },
             };
@@ -1772,8 +1828,8 @@ mod tests {
     fn widths_fall_back_to_all() {
         let w = Widths {
             all: Some(50),
-            table: None,
-            code: Some(Some(70)),
+            table: Limit::Inherit,
+            code: Limit::Cols(70),
         };
         assert_eq!(w.table(), Some(50));
         assert_eq!(w.code(), Some(70));
@@ -1800,7 +1856,7 @@ mod tests {
                 code,
                 Widths {
                     all: Some(80),
-                    code: Some(Some(6)),
+                    code: Limit::Cols(6),
                     ..Default::default()
                 }
             ),
@@ -1812,7 +1868,7 @@ mod tests {
                 code,
                 Widths {
                     all: Some(6),
-                    code: Some(Some(80)),
+                    code: Limit::Cols(80),
                     ..Default::default()
                 }
             ),
@@ -1824,7 +1880,7 @@ mod tests {
                 "aaa bbb ccc",
                 Widths {
                     all: Some(7),
-                    code: Some(Some(80)),
+                    code: Limit::Cols(80),
                     ..Default::default()
                 }
             ),
@@ -1836,7 +1892,7 @@ mod tests {
             plain_with(
                 md,
                 Widths {
-                    code: Some(Some(6)),
+                    code: Limit::Cols(6),
                     ..Default::default()
                 }
             ),
@@ -1852,7 +1908,7 @@ mod tests {
             plain_with(
                 md,
                 Widths {
-                    code: Some(Some(8)),
+                    code: Limit::Cols(8),
                     ..Default::default()
                 },
             )
@@ -1864,7 +1920,7 @@ mod tests {
         let quoted = plain_with(
             "> ```verylonglanguagename\n> abc\n> ```\n",
             Widths {
-                code: Some(Some(10)),
+                code: Limit::Cols(10),
                 ..Default::default()
             },
         );
@@ -1896,7 +1952,7 @@ mod tests {
                 table,
                 Widths {
                     all: Some(80),
-                    table: Some(Some(12)),
+                    table: Limit::Cols(12),
                     ..Default::default()
                 }
             ),
@@ -1909,7 +1965,7 @@ mod tests {
                 table,
                 Widths {
                     all: Some(8),
-                    table: Some(Some(80)),
+                    table: Limit::Cols(80),
                     ..Default::default()
                 }
             ),
@@ -1921,7 +1977,7 @@ mod tests {
                 "aaa bbb ccc",
                 Widths {
                     all: Some(7),
-                    table: Some(Some(80)),
+                    table: Limit::Cols(80),
                     ..Default::default()
                 }
             ),
@@ -1932,7 +1988,7 @@ mod tests {
                 "---",
                 Widths {
                     all: Some(8),
-                    table: Some(Some(80)),
+                    table: Limit::Cols(80),
                     ..Default::default()
                 }
             ),
@@ -1947,7 +2003,7 @@ mod tests {
         let out = plain_with(
             md,
             Widths {
-                table: Some(Some(12)),
+                table: Limit::Cols(12),
                 ..Default::default()
             },
         );
@@ -1965,10 +2021,14 @@ mod tests {
 
     /// Parse `config` then `cli` the way `main` does.
     fn merged(config: &str, cli: &str) -> super::Opts {
-        use super::{Opts, config_args, parse_args};
+        use super::{Flow, Opts, config_args, parse_args};
+        let settings = |args: &[String], cli| match parse_args(args, cli) {
+            Ok(Flow::Run(s)) => s,
+            other => panic!("expected settings, got {other:?}"),
+        };
         let mut o = Opts::default();
-        parse_args(&config_args(config), &mut o, false).expect("config parses");
-        parse_args(&args(cli), &mut o, true).expect("cli parses");
+        o.apply(&settings(&config_args(config), false));
+        o.apply(&settings(&args(cli), true));
         o
     }
 
@@ -2055,7 +2115,7 @@ mod tests {
 
     #[test]
     fn config_rejects_cli_only_arguments() {
-        use super::{Opts, parse_args};
+        use super::{Flow, Setting, parse_args};
         for bad in [
             "--help",
             "-V",
@@ -2064,21 +2124,18 @@ mod tests {
             "--bogus",
             "--width",
         ] {
-            let err = parse_args(&args(bad), &mut Opts::default(), false).unwrap_err();
+            let err = parse_args(&args(bad), false).unwrap_err();
             assert!(!err.show_help, "{bad}: config errors don't print help");
             assert!(!err.msg.is_empty());
         }
         // The same help/version flags work on the command line.
-        let mut o = Opts::default();
+        assert_eq!(parse_args(&args("--help"), true).unwrap(), Flow::Help);
         assert_eq!(
-            parse_args(&args("--help"), &mut o, true).unwrap(),
-            super::Flow::Help
+            parse_args(&args("--no-config"), true).unwrap(),
+            Flow::Run(vec![Setting::NoConfig])
         );
-        assert_eq!(
-            parse_args(&args("--no-config"), &mut o, true).unwrap(),
-            super::Flow::Run
-        );
-        assert!(o.no_config);
+        // Only one FILE on the command line.
+        assert!(parse_args(&args("a.md b.md"), true).is_err());
     }
 
     #[test]
