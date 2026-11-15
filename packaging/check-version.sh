@@ -16,7 +16,7 @@ check() {
     fi
 }
 check packaging/mdhl.spec "$spec"
-if [ $# -gt 0 ]; then
+if [ -n "${1:-}" ]; then
     check "tag $1" "${1#v}"
 fi
 

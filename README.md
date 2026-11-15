@@ -25,14 +25,38 @@ sudo make install PREFIX=/usr/local
 
 `DESTDIR` is supported for staged installs when packaging.
 
-### Fedora RPM
+### Prebuilt binaries
 
-Each [release](https://github.com/adduc/mdhl/releases) has an RPM for
-Fedora 44 (x86_64). Download it and install it with dnf:
+Each [release](https://github.com/adduc/mdhl/releases) has:
+
+- RPMs for Fedora 44 and 45 (x86_64). Install the one matching your
+  release with dnf:
+
+  ```sh
+  sudo dnf install ./mdhl-*.fc$(rpm -E %fedora).x86_64.rpm
+  ```
+
+- A tarball with a statically linked binary for any other Linux
+  distribution, for x86_64 and aarch64. It needs no libraries, so it runs
+  on glibc and musl (Alpine) systems alike:
+
+  ```sh
+  tar -xzf mdhl-*-$(uname -m)-linux.tar.gz
+  install -Dm755 mdhl-*-$(uname -m)-linux/mdhl ~/.local/bin/mdhl
+  ```
+
+`SHA256SUMS` lists the checksums of every file (`sha256sum -c --ignore-missing SHA256SUMS`).
+
+To build the tarball yourself, add the musl target and run `make dist`. It
+lands in `target/dist/`. Set `RUST_TARGET` to build for another
+architecture, e.g. `RUST_TARGET=aarch64-unknown-linux-musl`.
 
 ```sh
-sudo dnf install ./mdhl-*.fc44.x86_64.rpm
+rustup target add $(uname -m)-unknown-linux-musl
+make dist
 ```
+
+### Fedora RPM
 
 To build the RPMs yourself, install the packaging tools and run `make rpm`.
 The source tarball comes from `git archive`, so only committed changes are
@@ -164,9 +188,11 @@ cargo run -- sample.md --width 80
    git push origin v0.2.0
    ```
 
-The Release workflow builds the binary and source RPMs in a Fedora 44
-container and attaches them to a GitHub release for the tag. It stops if
-the tag doesn't match the version.
+The Release workflow builds the RPMs in Fedora 44 and 45 containers and
+the static tarballs for x86_64 and aarch64, then attaches them all, with a
+`SHA256SUMS` file, to a GitHub release for the tag. It stops if the tag
+doesn't match the version. Pull requests that touch the packaging run the
+same builds without publishing.
 
 ## License
 

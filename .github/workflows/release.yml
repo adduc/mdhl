@@ -1,44 +1,127 @@
 name: Release
 
-# Pushing a tag like v1.2.0 builds the Fedora RPMs and attaches them to a
-# GitHub release for that tag. Bump the version in Cargo.toml and the spec
-# file first; the build stops if they disagree.
+# Pushing a tag like v1.2.0 builds Fedora RPMs and static Linux tarballs and
+# attaches them to a GitHub release for that tag. Bump the version in
+# Cargo.toml and the spec file first; the build stops if they disagree.
+#
+# Pull requests that touch the packaging run the same builds without
+# publishing, so a broken release is caught before tagging.
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - packaging/**
+      - Makefile
+      - Cargo.toml
+      - Cargo.lock
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  rpm:
+  version:
     runs-on: ubuntu-24.04
-    container: fedora:44
+    steps:
+      - uses: actions/checkout@v7
+      # On a tag, the tag must match too.
+      - run: packaging/check-version.sh ${TAG:+"$TAG"}
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+  rpm:
+    needs: version
+    strategy:
+      matrix:
+        fedora: [44, 45]
+    runs-on: ubuntu-24.04
+    container: fedora:${{ matrix.fedora }}
     steps:
       - name: Install build tools
-        run: dnf install -y git gh make rpm-build cargo-rpm-macros
+        run: dnf install -y git make rpm-build cargo-rpm-macros
 
       - uses: actions/checkout@v7
 
       # The checkout is owned by a different user than the container's root.
       - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - run: packaging/check-version.sh "$GITHUB_REF_NAME"
-
       - run: make rpm
 
       # The source RPM carries the vendored crates, so it rebuilds offline.
       # debuginfo and debugsource are left out; they're only useful with a
       # debuginfo repository behind them.
+      - name: Collect RPMs
+        run: |
+          mkdir dist
+          find target/rpmbuild/SRPMS target/rpmbuild/RPMS -name '*.rpm' \
+              ! -name '*-debuginfo-*' ! -name '*-debugsource-*' \
+              -exec cp {} dist/ \;
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rpm-fc${{ matrix.fedora }}
+          path: dist/
+          if-no-files-found: error
+
+  # Static musl binaries for every other distribution. Each architecture
+  # builds natively on its own runner.
+  tarball:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+
+      - run: make dist RUST_TARGET=${{ matrix.arch }}-unknown-linux-musl
+
+      # Fails if the binary picked up a dynamic loader.
+      - name: Check the binary is static and runs
+        run: |
+          bin=target/${{ matrix.arch }}-unknown-linux-musl/release/mdhl
+          file "$bin"
+          file "$bin" | grep -q 'static'
+          "$bin" --version
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: target/dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [rpm, tarball]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Publish release
+        working-directory: dist
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          files=$(find target/rpmbuild/SRPMS target/rpmbuild/RPMS -name '*.rpm' \
-              ! -name '*-debuginfo-*' ! -name '*-debugsource-*')
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" --clobber $files
+            gh release upload "$GITHUB_REF_NAME" --clobber -- *
           else
-            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes $files
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes -- *
           fi

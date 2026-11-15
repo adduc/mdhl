@@ -6,6 +6,9 @@
 #   make uninstall       remove it again
 #   make clean           remove build output
 #   make rpm             build a Fedora RPM (see packaging/build-rpm.sh)
+#   make dist            build a static Linux tarball in target/dist/
+#                        (see packaging/build-tarball.sh; set RUST_TARGET to
+#                        cross-build, e.g. RUST_TARGET=aarch64-unknown-linux-musl)
 #
 # Installs into ~/.local by default, so no root is needed. For a system-wide
 # install, override PREFIX:
@@ -23,7 +26,7 @@ INSTALL ?= install
 BIN     := mdhl
 TARGET  := target/release/$(BIN)
 
-.PHONY: all build test install uninstall clean rpm
+.PHONY: all build test install uninstall clean rpm dist
 
 all: build
 
@@ -48,3 +51,7 @@ clean:
 # Needs rpm-build and cargo-rpm-macros. Output lands in target/rpmbuild/.
 rpm:
 	packaging/build-rpm.sh
+
+# Needs the musl target: rustup target add $(uname -m)-unknown-linux-musl
+dist:
+	packaging/build-tarball.sh $(RUST_TARGET)
