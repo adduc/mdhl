@@ -463,9 +463,10 @@ impl<'w, W: Write> Emitter<'w, W> {
 
     fn rule(&mut self) {
         self.begin_line(true);
-        // With a width set the rule spans the whole available line (so it
-        // matches blocks like tables that fill it); without one it stays a
-        // modest 40 columns.
+        // With `--width` set the rule spans the whole available line;
+        // without it the rule stays a modest 40 columns. It deliberately
+        // ignores `--table-width`/`--code-width`, which only size their own
+        // blocks, so a table can end up wider or narrower than the rules.
         let n = self
             .widths
             .all

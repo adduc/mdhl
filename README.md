@@ -56,7 +56,8 @@ Piping the output or setting `NO_COLOR` turns colors off.
   Columns with content never shrink below 1 char; if N is too small the
   table overflows, but rows stay aligned.
 - Horizontal rules (`---`) span the full available line — N minus the
-  active gutter — matching shrink-fit tables that fill the full width:
+  active gutter — so with `--width` alone they line up with shrink-fit
+  tables that fill the full width:
 
   ```text
   $ mdhl --width 40
@@ -67,7 +68,9 @@ Piping the output or setting `NO_COLOR` turns colors off.
   ```
 
   A table narrower than N stays at its natural width; the rule still
-  spans the full line.
+  spans the full line. Rules always follow `--width` (40 columns without
+  it), not `--table-width`, so with a separate table width the two no
+  longer line up.
 
 ### Table width (`--table-width N`)
 
