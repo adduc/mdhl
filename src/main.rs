@@ -159,12 +159,8 @@ struct Emitter<'w, W: Write> {
     code_lang: Option<String>,
     /// A footnote-definition paragraph continues on its label line.
     after_label: bool,
-    /// Max display columns for wrapping; `None` = no wrapping.
-    width: Option<usize>,
-    /// Max display columns for tables; `None` = fall back to `width`.
-    table_width: Option<usize>,
-    /// Max display columns for code blocks; `None` = fall back to `width`.
-    code_width: Option<usize>,
+    /// Output width limits (global, tables, code blocks).
+    widths: Widths,
     /// Display column the next byte lands in (visible columns on the line).
     col: usize,
     /// Column at which the current line's content starts (after gutters).
@@ -175,7 +171,7 @@ struct Emitter<'w, W: Write> {
 }
 
 impl<'w, W: Write> Emitter<'w, W> {
-    fn new(w: &'w mut W, color: bool, base_style: Style, width: Option<usize>) -> Self {
+    fn new(w: &'w mut W, color: bool, base_style: Style, widths: Widths) -> Self {
         Self {
             w,
             color,
@@ -192,9 +188,7 @@ impl<'w, W: Write> Emitter<'w, W> {
             link_brackets: false,
             code_lang: None,
             after_label: false,
-            width,
-            table_width: None,
-            code_width: None,
+            widths,
             col: 0,
             line_start_col: 0,
             pending_sp: 0,
@@ -387,7 +381,7 @@ impl<'w, W: Write> Emitter<'w, W> {
 
     /// Write `text` as one run, wrapping at the global width.
     fn wrap(&mut self, text: &str, style: Option<Style>) {
-        self.wrap_at(text, style, self.width);
+        self.wrap_at(text, style, self.widths.all);
     }
 
     /// Write `text` as one run, wrapping at word boundaries when `width` is
@@ -445,7 +439,7 @@ impl<'w, W: Write> Emitter<'w, W> {
     /// The language caption and code lines wrap at `--code-width`, falling
     /// back to `--width`.
     fn emit_code(&mut self, text: &str) {
-        let width = self.code_width.or(self.width);
+        let width = self.widths.code();
         if let Some(lang) = self.code_lang.take() {
             if !lang.is_empty() {
                 self.begin_caption();
@@ -479,7 +473,8 @@ impl<'w, W: Write> Emitter<'w, W> {
         // matches blocks like tables that fill it); without one it stays a
         // modest 40 columns.
         let n = self
-            .width
+            .widths
+            .all
             .map_or(40, |w| w.saturating_sub(self.gutter_width()));
         if n > 0 {
             let _ = self.write_run(&"─".repeat(n), Some(plain_style(C_BORDER)));
@@ -576,14 +571,14 @@ impl<'w, W: Write> Emitter<'w, W> {
             for cell in row {
                 let mut plain_buf: Vec<u8> = Vec::new();
                 {
-                    let mut em = Emitter::new(&mut plain_buf, false, base, None);
+                    let mut em = Emitter::new(&mut plain_buf, false, base, Widths::default());
                     for ev in cell {
                         handle_event(&mut em, ev);
                     }
                 }
                 let mut styled_buf: Vec<u8> = Vec::new();
                 {
-                    let mut em = Emitter::new(&mut styled_buf, self.color, base, None);
+                    let mut em = Emitter::new(&mut styled_buf, self.color, base, Widths::default());
                     for ev in cell {
                         handle_event(&mut em, ev);
                     }
@@ -619,7 +614,7 @@ impl<'w, W: Write> Emitter<'w, W> {
         // Columns with content never shrink below 1: a 0-wide column would
         // leave its content unwrapped and the row borders would no longer
         // meet the separator's.
-        if let Some(w) = self.table_width.or(self.width) {
+        if let Some(w) = self.widths.table() {
             let gutter = self.gutter_width();
             let overhead = 3 * widths.len() + 1;
             let budget = w
@@ -1121,7 +1116,7 @@ fn handle_event<W: Write>(em: &mut Emitter<W>, ev: &Event<'_>) {
 // ---------------------------------------------------------------------------
 
 /// Output width limits, in display columns; `None` = no limit.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Widths {
     /// Everything (`--width`).
     all: Option<usize>,
@@ -1129,6 +1124,27 @@ struct Widths {
     table: Option<usize>,
     /// Code blocks (`--code-width`); falls back to `all`.
     code: Option<usize>,
+}
+
+impl Widths {
+    /// Effective table budget: `--table-width`, else `--width`.
+    fn table(&self) -> Option<usize> {
+        self.table.or(self.all)
+    }
+
+    /// Effective code-block wrap width: `--code-width`, else `--width`.
+    fn code(&self) -> Option<usize> {
+        self.code.or(self.all)
+    }
+
+    /// The field a width option (by canonical name) sets.
+    fn slot(&mut self, flag: &str) -> &mut Option<usize> {
+        match flag {
+            "--table-width" => &mut self.table,
+            "--code-width" => &mut self.code,
+            _ => &mut self.all,
+        }
+    }
 }
 
 fn render(md: &str, color: bool, widths: Widths) -> Vec<u8> {
@@ -1139,9 +1155,7 @@ fn render(md: &str, color: bool, widths: Widths) -> Vec<u8> {
         | Options::ENABLE_MATH;
     let mut iter = Parser::new_ext(md, options);
     let mut buf: Vec<u8> = Vec::new();
-    let mut em = Emitter::new(&mut buf, color, Style::default(), widths.all);
-    em.table_width = widths.table;
-    em.code_width = widths.code;
+    let mut em = Emitter::new(&mut buf, color, Style::default(), widths);
 
     while let Some(ev) = iter.next() {
         if let Event::Start(Tag::Table(aligns)) = &ev {
@@ -1199,13 +1213,12 @@ Options:
   -V, --version    Show version
 ";
 
-fn parse_width(flag: &str, v: &str) -> Option<usize> {
+fn parse_width(flag: &str, v: &str) -> Result<usize, String> {
     match v.parse::<usize>() {
-        Ok(n) if n > 0 => Some(n),
-        _ => {
-            eprintln!("mdhl: invalid {flag} value: {v} (expected a positive integer)");
-            None
-        }
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(format!(
+            "mdhl: invalid {flag} value: {v} (expected a positive integer)"
+        )),
     }
 }
 
@@ -1260,8 +1273,7 @@ fn main() -> ExitCode {
                     }
                 };
             }
-            _ if width_flag(a).is_some() => {
-                let (flag, inline) = width_flag(a).unwrap();
+            _ if let Some((flag, inline)) = width_flag(a) => {
                 let v = match inline {
                     Some(v) => v,
                     None => {
@@ -1275,15 +1287,13 @@ fn main() -> ExitCode {
                         }
                     }
                 };
-                let Some(n) = parse_width(flag, v) else {
-                    return ExitCode::from(2);
-                };
-                let slot = match flag {
-                    "--table-width" => &mut widths.table,
-                    "--code-width" => &mut widths.code,
-                    _ => &mut widths.all,
-                };
-                *slot = Some(n);
+                match parse_width(flag, v) {
+                    Ok(n) => *widths.slot(flag) = Some(n),
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        return ExitCode::from(2);
+                    }
+                }
             }
             s if s.starts_with('-') && s != "-" => {
                 eprintln!("mdhl: unknown option: {a}");
@@ -1542,9 +1552,46 @@ mod tests {
 
     #[test]
     fn width_parsing_rejects_bad_values() {
-        assert_eq!(super::parse_width("--width", "40").unwrap(), 40);
-        assert!(super::parse_width("--width", "0").is_none());
-        assert!(super::parse_width("--width", "abc").is_none());
+        use super::parse_width;
+        for flag in ["--width", "--table-width", "--code-width"] {
+            assert_eq!(parse_width(flag, "40"), Ok(40));
+            for bad in ["0", "abc", "-3", ""] {
+                let err = parse_width(flag, bad).unwrap_err();
+                assert!(
+                    err.contains(&format!("invalid {flag} value: {bad} ")),
+                    "{flag} {bad:?}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn width_flags_set_their_own_field() {
+        // Each option (in every spelling) lands in its own Widths field.
+        for (arg, value) in [
+            ("--width", 1),
+            ("-w", 1),
+            ("--table-width", 2),
+            ("--code-width", 3),
+        ] {
+            let (flag, _) = super::width_flag(arg).unwrap();
+            let mut w = Widths::default();
+            *w.slot(flag) = Some(value);
+            let expect = match value {
+                1 => Widths { all: Some(1), ..Default::default() },
+                2 => Widths { table: Some(2), ..Default::default() },
+                _ => Widths { code: Some(3), ..Default::default() },
+            };
+            assert_eq!(w, expect, "{arg}");
+        }
+    }
+
+    #[test]
+    fn widths_fall_back_to_all() {
+        let w = Widths { all: Some(50), table: None, code: Some(70) };
+        assert_eq!(w.table(), Some(50));
+        assert_eq!(w.code(), Some(70));
+        assert_eq!(Widths::default().table(), None);
     }
 
     fn all(w: usize) -> Widths {
