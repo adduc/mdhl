@@ -37,6 +37,10 @@ Exit codes: `0` on success, `2` on usage errors, `141` when the reader
 | `-w, --width N`     | Wrap output at N display columns; no wrapping by default            |
 | `--table-width N`   | Fit tables in N display columns, overriding `--width` for tables    |
 | `--code-width N`    | Wrap code blocks at N display columns, overriding `--width` for code |
+| `--no-width`        | Remove the `--width` limit (e.g. one set in the config)             |
+| `--no-table-width`  | Don't limit table width, even when `--width` is set                 |
+| `--no-code-width`   | Don't wrap code blocks, even when `--width` is set                  |
+| `--no-config`       | Ignore the config file                                              |
 | `-h, --help`        | Show help                                                           |
 | `-V, --version`     | Show version                                                        |
 
@@ -100,6 +104,53 @@ mdhl doc.md --code-width 100              # wrap only code blocks
 ```
 
 Inline code spans are prose and follow `--width`.
+
+## Config file
+
+Default options are read from the first usable one of these files:
+
+1. `$MDHL_CONFIG` — if set, the only file tried, and it must exist
+2. `$XDG_CONFIG_HOME/mdhl/config` (default `~/.config/mdhl/config`)
+3. `/etc/mdhl/config` — system-wide fallback
+
+A missing default file is skipped silently; a broken one is warned about
+and skipped (see below). So a typo in your user config means
+`/etc/mdhl/config`, if it exists, applies instead.
+
+The file holds options as on the command line, separated by whitespace or
+newlines. There is no shell quoting: values can't contain spaces. A word
+starting with `#` begins a comment that runs to the end of the line, so
+both whole-line and trailing comments work (`-w 80  # wrap prose`).
+
+```text
+# ~/.config/mdhl/config
+-w 80
+--table-width 120
+--code-width 120
+--color
+```
+
+Command-line options are applied after the config, so each one wins over
+the same option in the config: `--width 60` replaces the configured width,
+`--no-width` / `--no-table-width` / `--no-code-width` remove a configured
+limit, and `--color=auto` / `--no-color` undo a configured `--color`.
+`--no-config` skips the file entirely.
+
+`--width` only replaces `--width`. A `--table-width` or `--code-width` set
+in the config still applies, so with the config above, `mdhl -w 60 doc.md`
+wraps prose at 60 but keeps tables and code at 120. Pass `--table-width` /
+`--code-width` (or `--no-table-width` / `--no-code-width`) on the command
+line to change those too.
+
+A config may only set options: `FILE`, `--help`, `--version`, and
+`--no-config` are rejected. A missing config file is silently skipped. Any
+other problem with one of the default files — it can't be read, isn't a
+regular file, or contains an invalid option — prints a warning naming the
+file, and that file is ignored (the next one in the list is tried). An
+explicit `$MDHL_CONFIG` is stricter: any such problem, including a missing
+file, is an error (exit `2`). Command-line errors and
+`--help` are reported before the config is read, so a broken config
+never hides them.
 
 ## Rendering
 
