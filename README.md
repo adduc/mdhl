@@ -107,11 +107,15 @@ Inline code spans are prose and follow `--width`.
 
 ## Config file
 
-Default options are read from the first of these files that exists:
+Default options are read from the first usable one of these files:
 
 1. `$MDHL_CONFIG` — if set, the only file tried, and it must exist
 2. `$XDG_CONFIG_HOME/mdhl/config` (default `~/.config/mdhl/config`)
 3. `/etc/mdhl/config` — system-wide fallback
+
+A missing default file is skipped silently; a broken one is warned about
+and skipped (see below). So a typo in your user config means
+`/etc/mdhl/config`, if it exists, applies instead.
 
 The file holds options as on the command line, separated by whitespace or
 newlines. There is no shell quoting: values can't contain spaces. A word

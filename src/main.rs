@@ -9,9 +9,10 @@
 //! `--table-width N` and `--code-width N` override it for tables and code
 //! blocks; `--no-width` & co. remove a limit.
 //!
-//! Config: default options come from the first existing file among
-//! `$MDHL_CONFIG`, `$XDG_CONFIG_HOME/mdhl/config` and `/etc/mdhl/config`,
-//! in command-line syntax; the command line overrides them.
+//! Config: default options come from `$MDHL_CONFIG` if set, else from the
+//! first usable file among `$XDG_CONFIG_HOME/mdhl/config` and
+//! `/etc/mdhl/config` (a broken one is warned about and skipped), in
+//! command-line syntax; the command line overrides them.
 
 use std::env;
 use std::ffi::OsString;
@@ -1239,15 +1240,17 @@ Options:
   -h, --help          Show this help
   -V, --version       Show version
 
-Config: default options are read from the first of $MDHL_CONFIG,
-$XDG_CONFIG_HOME/mdhl/config (~/.config/mdhl/config), /etc/mdhl/config
-that exists. It holds options as on the command line, whitespace- or
-line-separated (no quoting); a word starting with `#` starts a comment.
+Config: default options are read from $MDHL_CONFIG if set (it must
+exist); otherwise from the first usable one of $XDG_CONFIG_HOME/mdhl/config
+(~/.config/mdhl/config) and /etc/mdhl/config. A default config that can't
+be read or has an invalid option is warned about and skipped, and the next
+one is tried. It holds options as on the command line, whitespace- or
+line-separated (no quoting); a word starting with # starts a comment.
 Command-line options win over the same option in the config; -w doesn't
 change a configured --table-width or --code-width.
 ";
 
-/// System-wide config, used when no user config exists.
+/// System-wide config, used when no user config is found or usable.
 const SYSTEM_CONFIG: &str = "/etc/mdhl/config";
 
 fn parse_width(flag: &str, v: &str) -> Result<usize, String> {
@@ -1305,7 +1308,6 @@ struct Opts {
     color: Option<bool>,
     widths: Widths,
     file: Option<String>,
-    no_config: bool,
 }
 
 impl Opts {
@@ -1316,7 +1318,8 @@ impl Opts {
                 Setting::Color(c) => self.color = *c,
                 Setting::Width(flag, limit) => self.widths.set(flag, *limit),
                 Setting::File(f) => self.file = Some(f.clone()),
-                Setting::NoConfig => self.no_config = true,
+                // Acted on in `main`, before the config is read.
+                Setting::NoConfig => {}
             }
         }
     }
@@ -1349,8 +1352,8 @@ impl From<String> for ArgError {
 
 /// Parse `args` into settings, without applying them, so the config's and
 /// the command line's are each validated once and then layered in `main`.
-/// `cli` is false for config-file arguments, which may only set option
-/// defaults: no FILE, `--help`, `--version`, or `--no-config`.
+/// `cli` is false for config-file arguments (see [`parse_config_args`]),
+/// which may not hold FILE or `--no-config`.
 fn parse_args(args: &[String], cli: bool) -> Result<Flow, ArgError> {
     let mut settings = Vec::new();
     let mut have_file = false;
@@ -1358,7 +1361,7 @@ fn parse_args(args: &[String], cli: bool) -> Result<Flow, ArgError> {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "-h" | "--help" | "-V" | "--version" | "--no-config" if !cli => {
+            "--no-config" if !cli => {
                 return Err(format!("{a} is not allowed in a config file").into());
             }
             "-h" | "--help" => return Ok(Flow::Help),
@@ -1419,7 +1422,21 @@ fn parse_args(args: &[String], cli: bool) -> Result<Flow, ArgError> {
     Ok(Flow::Run(settings))
 }
 
-/// Config files to try, in order; the first that exists is used. When
+/// Parse config-file arguments. A config may only set option defaults, so
+/// `--help` and `--version` are errors here rather than actions.
+fn parse_config_args(args: &[String]) -> Result<Vec<Setting>, ArgError> {
+    match parse_args(args, false)? {
+        Flow::Run(settings) => Ok(settings),
+        Flow::Help => Err("-h/--help is not allowed in a config file"
+            .to_string()
+            .into()),
+        Flow::Version => Err("-V/--version is not allowed in a config file"
+            .to_string()
+            .into()),
+    }
+}
+
+/// Config files to try, in order; the first usable one is used. When
 /// `required`, the (single) path was named explicitly and must exist.
 struct ConfigSearch {
     paths: Vec<PathBuf>,
@@ -1492,11 +1509,8 @@ fn load_config(
                 continue;
             }
         };
-        match parse_args(&config_args(&text), false) {
-            Ok(Flow::Run(settings)) => return Ok(settings),
-            Ok(Flow::Help | Flow::Version) => {
-                unreachable!("parse_args rejects --help/--version in a config")
-            }
+        match parse_config_args(&config_args(&text)) {
+            Ok(settings) => return Ok(settings),
             Err(e) => problem(format!("{}: {}", path.display(), e.msg))?,
         }
     }
@@ -2024,14 +2038,13 @@ mod tests {
 
     /// Parse `config` then `cli` the way `main` does.
     fn merged(config: &str, cli: &str) -> super::Opts {
-        use super::{Flow, Opts, config_args, parse_args};
-        let settings = |args: &[String], cli| match parse_args(args, cli) {
-            Ok(Flow::Run(s)) => s,
-            other => panic!("expected settings, got {other:?}"),
-        };
+        use super::{Flow, Opts, config_args, parse_args, parse_config_args};
         let mut o = Opts::default();
-        o.apply(&settings(&config_args(config), false));
-        o.apply(&settings(&args(cli), true));
+        o.apply(&parse_config_args(&config_args(config)).expect("valid config"));
+        match parse_args(&args(cli), true) {
+            Ok(Flow::Run(s)) => o.apply(&s),
+            other => panic!("expected settings, got {other:?}"),
+        }
         o
     }
 
@@ -2053,7 +2066,7 @@ mod tests {
 
     #[test]
     fn optional_config_problems_warn_and_skip() {
-        use super::{ConfigSearch, Flow, load_config, parse_args};
+        use super::{ConfigSearch, load_config, parse_config_args};
         let dir = std::env::temp_dir().join(format!("mdhl-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("isdir")).unwrap();
@@ -2066,7 +2079,7 @@ mod tests {
         };
         let all = [
             "missing",     // NotFound: skipped silently
-            "file/config", // parent is a file
+            "file/config", // parent is a file (NotFound on Windows: silent)
             "isdir",       // a directory (PermissionDenied on Windows)
             "bad",         // invalid option
             "real",
@@ -2074,12 +2087,15 @@ mod tests {
         let mut warnings = Vec::new();
         let found = load_config(&search(&all, false), &mut |m| warnings.push(m))
             .expect("optional paths never fail");
-        let Ok(Flow::Run(expected)) = parse_args(&args("-w 70"), false) else {
-            panic!("-w 70 should parse")
-        };
-        assert_eq!(found, expected);
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
-        assert!(warnings[2].contains("--bogus"), "{warnings:?}");
+        assert_eq!(found, parse_config_args(&args("-w 70")).unwrap());
+        // Windows reports a path through a file as ERROR_PATH_NOT_FOUND,
+        // which Rust maps to NotFound, so that one is skipped without a word.
+        let expected_warnings = if cfg!(windows) { 2 } else { 3 };
+        assert_eq!(warnings.len(), expected_warnings, "{warnings:?}");
+        assert!(
+            warnings.last().is_some_and(|w| w.contains("--bogus")),
+            "{warnings:?}"
+        );
 
         // Nothing usable: no settings, and a missing file isn't worth a warning.
         let mut warnings = Vec::new();
@@ -2138,7 +2154,7 @@ mod tests {
 
     #[test]
     fn config_rejects_cli_only_arguments() {
-        use super::{Flow, Setting, parse_args};
+        use super::{Flow, Setting, parse_args, parse_config_args};
         for bad in [
             "--help",
             "-V",
@@ -2147,7 +2163,7 @@ mod tests {
             "--bogus",
             "--width",
         ] {
-            let err = parse_args(&args(bad), false).unwrap_err();
+            let err = parse_config_args(&args(bad)).unwrap_err();
             assert!(!err.show_help, "{bad}: config errors don't print help");
             assert!(!err.msg.is_empty());
         }
@@ -2176,8 +2192,16 @@ mod tests {
         };
         let paths = |v: &[&str]| v.iter().map(PathBuf::from).collect::<Vec<_>>();
 
-        let s = config_search(env(&[("XDG_CONFIG_HOME", "/x"), ("HOME", "/h")]));
-        assert_eq!(s.paths, paths(&["/x/mdhl/config", SYSTEM_CONFIG]));
+        // XDG_CONFIG_HOME must be absolute, and "/x" has no drive on Windows.
+        const XDG: &str = if cfg!(windows) { r"C:\x" } else { "/x" };
+        let s = config_search(env(&[("XDG_CONFIG_HOME", XDG), ("HOME", "/h")]));
+        assert_eq!(
+            s.paths,
+            vec![
+                PathBuf::from(XDG).join("mdhl").join("config"),
+                PathBuf::from(SYSTEM_CONFIG)
+            ]
+        );
         assert!(!s.required);
 
         // Unset, empty, or relative XDG_CONFIG_HOME falls back to ~/.config.
