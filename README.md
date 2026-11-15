@@ -5,8 +5,42 @@ Parses with `pulldown-cmark`, renders to the terminal — no HTML, no pager.
 
 ## Build
 
+Needs Rust 1.95 or newer.
+
 ```sh
-cargo build --release
+make        # build a release binary (cargo build --release)
+make test   # run the tests
+```
+
+### Installing
+
+`make install` copies the binary to `~/.local/bin`; `make uninstall`
+removes it. For a system-wide install, set `PREFIX`, and build first so
+cargo doesn't run as root:
+
+```sh
+make
+sudo make install PREFIX=/usr/local
+```
+
+`DESTDIR` is supported for staged installs when packaging.
+
+### Fedora RPM
+
+Each [release](https://github.com/adduc/mdhl/releases) has an RPM for
+Fedora 44 (x86_64). Download it and install it with dnf:
+
+```sh
+sudo dnf install ./mdhl-*.fc44.x86_64.rpm
+```
+
+To build the RPMs yourself, install the packaging tools and run `make rpm`.
+The source tarball comes from `git archive`, so only committed changes are
+included. The RPMs land in `target/rpmbuild/`.
+
+```sh
+sudo dnf install rpm-build cargo-rpm-macros
+make rpm
 ```
 
 ## Usage
@@ -117,3 +151,23 @@ rendering feature.
 cargo test
 cargo run -- sample.md --width 80
 ```
+
+## Releasing
+
+1. Bump the version in `Cargo.toml` and in `Version:` of
+   `packaging/mdhl.spec`, and add a `%changelog` entry to the spec.
+   `packaging/check-version.sh` (also run in CI) checks that they agree.
+2. Merge to `main`, then tag and push:
+
+   ```sh
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+The Release workflow builds the binary and source RPMs in a Fedora 44
+container and attaches them to a GitHub release for the tag. It stops if
+the tag doesn't match the version.
+
+## License
+
+GPL-3.0-or-later. See `LICENSE`.
