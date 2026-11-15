@@ -5,7 +5,9 @@
 //! Color policy: ANSI escapes are emitted when stdout is a TTY, unless
 //! `NO_COLOR` is set or `--no-color` is given; `--color` forces them on.
 
-//! Width: `--width N` wraps all output to at most N display columns.
+//! Width: `--width N` wraps all output to at most N display columns;
+//! `--table-width N` and `--code-width N` override it for tables and code
+//! blocks.
 
 use std::env;
 use std::io::{self, IsTerminal, Read, Write};
@@ -159,6 +161,10 @@ struct Emitter<'w, W: Write> {
     after_label: bool,
     /// Max display columns for wrapping; `None` = no wrapping.
     width: Option<usize>,
+    /// Max display columns for tables; `None` = fall back to `width`.
+    table_width: Option<usize>,
+    /// Max display columns for code blocks; `None` = fall back to `width`.
+    code_width: Option<usize>,
     /// Display column the next byte lands in (visible columns on the line).
     col: usize,
     /// Column at which the current line's content starts (after gutters).
@@ -187,6 +193,8 @@ impl<'w, W: Write> Emitter<'w, W> {
             code_lang: None,
             after_label: false,
             width,
+            table_width: None,
+            code_width: None,
             col: 0,
             line_start_col: 0,
             pending_sp: 0,
@@ -377,13 +385,18 @@ impl<'w, W: Write> Emitter<'w, W> {
         }
     }
 
-    /// Write `text` as one run, wrapping at word boundaries when a width is
-    /// set. A token longer than a full line is hard-broken characterwise.
+    /// Write `text` as one run, wrapping at the global width.
     fn wrap(&mut self, text: &str, style: Option<Style>) {
+        self.wrap_at(text, style, self.width);
+    }
+
+    /// Write `text` as one run, wrapping at word boundaries when `width` is
+    /// set. A token longer than a full line is hard-broken characterwise.
+    fn wrap_at(&mut self, text: &str, style: Option<Style>, width: Option<usize>) {
         if text.is_empty() {
             return;
         }
-        let width = match self.width {
+        let width = match width {
             // Width that does not even fit the current gutters: leave alone.
             Some(w) if w > self.line_start_col => w,
             _ => {
@@ -429,11 +442,14 @@ impl<'w, W: Write> Emitter<'w, W> {
     }
 
     /// Render the text of a code block with the `│` border gutter.
+    /// The language caption and code lines wrap at `--code-width`, falling
+    /// back to `--width`.
     fn emit_code(&mut self, text: &str) {
+        let width = self.code_width.or(self.width);
         if let Some(lang) = self.code_lang.take() {
             if !lang.is_empty() {
                 self.begin_caption();
-                let _ = self.wrap(
+                self.wrap_at(
                     &lang,
                     Some(Style {
                         italic: true,
@@ -441,6 +457,7 @@ impl<'w, W: Write> Emitter<'w, W> {
                         dim: true,
                         ..Default::default()
                     }),
+                    width,
                 );
             }
         }
@@ -451,7 +468,7 @@ impl<'w, W: Write> Emitter<'w, W> {
                 continue; // trailing newline of the block
             }
             self.begin_line(true);
-            let _ = self.wrap(seg, Some(style));
+            self.wrap_at(seg, Some(style), width);
         }
         self.pending = true;
     }
@@ -595,13 +612,14 @@ impl<'w, W: Write> Emitter<'w, W> {
             }
         }
 
-        // If a width is set, shrink columns so the whole table fits in it
+        // If a table width (or, failing that, the global width) is set,
+        // shrink columns so the whole table fits in it
         // (overhead: one border per column plus two cell-edge paddings, and a
         // leading border; gutter prefixes count against the budget too).
         // Columns with content never shrink below 1: a 0-wide column would
         // leave its content unwrapped and the row borders would no longer
         // meet the separator's.
-        if let Some(w) = self.width {
+        if let Some(w) = self.table_width.or(self.width) {
             let gutter = self.gutter_width();
             let overhead = 3 * widths.len() + 1;
             let budget = w
@@ -1102,7 +1120,18 @@ fn handle_event<W: Write>(em: &mut Emitter<W>, ev: &Event<'_>) {
 // Top-level rendering
 // ---------------------------------------------------------------------------
 
-fn render(md: &str, color: bool, width: Option<usize>) -> Vec<u8> {
+/// Output width limits, in display columns; `None` = no limit.
+#[derive(Clone, Copy, Debug, Default)]
+struct Widths {
+    /// Everything (`--width`).
+    all: Option<usize>,
+    /// Tables (`--table-width`); falls back to `all`.
+    table: Option<usize>,
+    /// Code blocks (`--code-width`); falls back to `all`.
+    code: Option<usize>,
+}
+
+fn render(md: &str, color: bool, widths: Widths) -> Vec<u8> {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_STRIKETHROUGH
@@ -1110,7 +1139,9 @@ fn render(md: &str, color: bool, width: Option<usize>) -> Vec<u8> {
         | Options::ENABLE_MATH;
     let mut iter = Parser::new_ext(md, options);
     let mut buf: Vec<u8> = Vec::new();
-    let mut em = Emitter::new(&mut buf, color, Style::default(), width);
+    let mut em = Emitter::new(&mut buf, color, Style::default(), widths.all);
+    em.table_width = widths.table;
+    em.code_width = widths.code;
 
     while let Some(ev) = iter.next() {
         if let Event::Start(Tag::Table(aligns)) = &ev {
@@ -1160,24 +1191,46 @@ Options:
                    never, auto (TTY + no NO_COLOR)
   --no-color       Disable ANSI colors (same as --color=never)
   -w, --width N    Wrap output at N display columns; no wrapping by default
+  --table-width N  Fit tables in N display columns, overriding --width
+                   for tables only (wider or narrower)
+  --code-width N   Wrap code blocks at N display columns, overriding
+                   --width for code blocks only (wider or narrower)
   -h, --help       Show this help
   -V, --version    Show version
 ";
 
-fn parse_width(v: &str) -> Option<usize> {
+fn parse_width(flag: &str, v: &str) -> Option<usize> {
     match v.parse::<usize>() {
         Ok(n) if n > 0 => Some(n),
         _ => {
-            eprintln!("mdhl: invalid --width value: {v} (expected a positive integer)");
+            eprintln!("mdhl: invalid {flag} value: {v} (expected a positive integer)");
             None
         }
+    }
+}
+
+/// Recognize a width option: returns its canonical name and, for the
+/// `--flag=N` / `-wN` forms, the attached value.
+fn width_flag(a: &str) -> Option<(&'static str, Option<&str>)> {
+    for flag in ["--width", "--table-width", "--code-width"] {
+        if a == flag {
+            return Some((flag, None));
+        }
+        if let Some(v) = a.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+            return Some((flag, Some(v)));
+        }
+    }
+    match a.strip_prefix("-w") {
+        Some("") => Some(("--width", None)),
+        Some(v) => Some(("--width", Some(v))),
+        None => None,
     }
 }
 
 fn main() -> ExitCode {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let mut color: Option<bool> = None;
-    let mut width: Option<usize> = None;
+    let mut widths = Widths::default();
     let mut file: Option<String> = None;
 
     let mut i = 0usize;
@@ -1207,31 +1260,30 @@ fn main() -> ExitCode {
                     }
                 };
             }
-            "--width" | "-w" => {
-                i += 1;
-                let v = match args.get(i) {
+            _ if width_flag(a).is_some() => {
+                let (flag, inline) = width_flag(a).unwrap();
+                let v = match inline {
                     Some(v) => v,
                     None => {
-                        eprintln!("mdhl: --width requires a value");
-                        return ExitCode::from(2);
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.as_str(),
+                            None => {
+                                eprintln!("mdhl: {flag} requires a value");
+                                return ExitCode::from(2);
+                            }
+                        }
                     }
                 };
-                let Some(n) = parse_width(v) else {
+                let Some(n) = parse_width(flag, v) else {
                     return ExitCode::from(2);
                 };
-                width = Some(n);
-            }
-            s if s.starts_with("--width=") => {
-                let Some(n) = parse_width(&s["--width=".len()..]) else {
-                    return ExitCode::from(2);
+                let slot = match flag {
+                    "--table-width" => &mut widths.table,
+                    "--code-width" => &mut widths.code,
+                    _ => &mut widths.all,
                 };
-                width = Some(n);
-            }
-            s if s.len() > 2 && s.starts_with("-w") => {
-                let Some(n) = parse_width(&a[2..]) else {
-                    return ExitCode::from(2);
-                };
-                width = Some(n);
+                *slot = Some(n);
             }
             s if s.starts_with('-') && s != "-" => {
                 eprintln!("mdhl: unknown option: {a}");
@@ -1270,7 +1322,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let out = render(&input, color, width);
+    let out = render(&input, color, widths);
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     if let Err(e) = handle.write_all(&out) {
@@ -1291,15 +1343,15 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::render;
+    use super::{render, Widths};
     use unicode_width::UnicodeWidthStr;
 
     fn plain(md: &str) -> String {
-        String::from_utf8(render(md, false, None)).expect("utf8 output")
+        String::from_utf8(render(md, false, Widths::default())).expect("utf8 output")
     }
 
     fn plain_w(md: &str, width: usize) -> String {
-        String::from_utf8(render(md, false, Some(width))).expect("utf8 output")
+        String::from_utf8(render(md, false, all(width))).expect("utf8 output")
     }
 
     /// Remove SGR escape sequences so colored output can be compared as text.
@@ -1370,9 +1422,9 @@ mod tests {
 
     #[test]
     fn color_toggle() {
-        let off = render("x **y**", false, None);
+        let off = render("x **y**", false, Widths::default());
         assert!(!off.contains(&0x1b));
-        let on = render("x **y**", true, None);
+        let on = render("x **y**", true, Widths::default());
         let open = b"\x1b[1;38;5;220m";
         assert!(on.windows(open.len()).any(|w| w == open));
         assert!(on.ends_with(b"\n".as_slice()));
@@ -1417,7 +1469,7 @@ mod tests {
     fn width_keeps_colored_tables_aligned() {
         let md = "| aaaa | bbbb |\n|------|------|\n| 1111 | 2222 |";
         let plain = plain_w(md, 12);
-        let on = render(md, true, Some(12));
+        let on = render(md, true, all(12));
         let colored = String::from_utf8(on).expect("utf8 output");
         assert!(colored.contains('\u{1b}'));
         assert_eq!(strip_ansi(&colored), plain);
@@ -1439,7 +1491,7 @@ mod tests {
             // Width-1 columns route every cell through wrap_pair's per-char
             // SGR chunking when color is on; the stripped colored text must
             // be identical to plain and keep the same uniform line widths.
-            let colored = String::from_utf8(render(md, true, Some(w))).expect("utf8 output");
+            let colored = String::from_utf8(render(md, true, all(w))).expect("utf8 output");
             assert_eq!(strip_ansi(&colored), out, "w={w}: colored differs from plain");
             let is_table = |l: &str| l.contains('│') || l.contains('├');
             let table: Vec<&str> = out.lines().filter(|l| is_table(l)).collect();
@@ -1490,8 +1542,75 @@ mod tests {
 
     #[test]
     fn width_parsing_rejects_bad_values() {
-        assert_eq!(super::parse_width("40").unwrap(), 40);
-        assert!(super::parse_width("0").is_none());
-        assert!(super::parse_width("abc").is_none());
+        assert_eq!(super::parse_width("--width", "40").unwrap(), 40);
+        assert!(super::parse_width("--width", "0").is_none());
+        assert!(super::parse_width("--width", "abc").is_none());
+    }
+
+    fn all(w: usize) -> Widths {
+        Widths { all: Some(w), ..Default::default() }
+    }
+
+    fn plain_with(md: &str, widths: Widths) -> String {
+        String::from_utf8(render(md, false, widths)).expect("utf8 output")
+    }
+
+    fn plain_tw(md: &str, width: Option<usize>, table_width: usize) -> String {
+        plain_with(md, Widths { all: width, table: Some(table_width), code: None })
+    }
+
+    fn plain_cw(md: &str, width: Option<usize>, code_width: usize) -> String {
+        plain_with(md, Widths { all: width, table: None, code: Some(code_width) })
+    }
+
+    #[test]
+    fn code_width_overrides_width_for_code_only() {
+        let code = "```\nabcdefghij\n```";
+        // Narrower than --width: code wraps at 6, as with --width 6.
+        assert_eq!(plain_cw(code, Some(80), 6), plain_w(code, 6));
+        // Wider than --width: code lines are left whole.
+        assert_eq!(plain_cw(code, Some(6), 80), "│ abcdefghij\n");
+        // Prose still follows --width.
+        assert_eq!(plain_cw("aaa bbb ccc", Some(7), 80), "aaa bbb\nccc\n");
+        // Without --width only code wraps.
+        let md = "aaa bbb ccc ddd\n\n```\nabcdefghij\n```";
+        assert_eq!(plain_cw(md, None, 6), "aaa bbb ccc ddd\n\n│ abcd\n│ efgh\n│ ij\n");
+    }
+
+    #[test]
+    fn width_flag_forms() {
+        use super::width_flag;
+        assert_eq!(width_flag("--width"), Some(("--width", None)));
+        assert_eq!(width_flag("--width=5"), Some(("--width", Some("5"))));
+        assert_eq!(width_flag("-w"), Some(("--width", None)));
+        assert_eq!(width_flag("-w5"), Some(("--width", Some("5"))));
+        assert_eq!(width_flag("--table-width=9"), Some(("--table-width", Some("9"))));
+        assert_eq!(width_flag("--code-width"), Some(("--code-width", None)));
+        assert_eq!(width_flag("--widthx"), None);
+        assert_eq!(width_flag("--color"), None);
+    }
+
+    #[test]
+    fn table_width_overrides_width_for_tables_only() {
+        let table = "| aaaa | bbbb |\n|------|------|\n| 1111 | 2222 |";
+        // Narrower than --width: the table shrinks to 12, as with --width 12.
+        assert_eq!(plain_tw(table, Some(80), 12), plain_w(table, 12));
+        // Wider than --width: the table keeps its natural width and its
+        // borders are not wrapped by the global width.
+        assert_eq!(plain_tw(table, Some(8), 80), plain(table));
+        // Paragraphs and rules still follow --width.
+        assert_eq!(plain_tw("aaa bbb ccc", Some(7), 80), "aaa bbb\nccc\n");
+        assert_eq!(plain_tw("---", Some(8), 80), format!("{}\n", "─".repeat(8)));
+    }
+
+    #[test]
+    fn table_width_without_width() {
+        // Tables fit the budget while other text stays unwrapped.
+        let md = "aaa bbb ccc ddd eee\n\n| aaaa | bbbb |\n|------|------|\n| 1111 | 2222 |";
+        let out = plain_tw(md, None, 12);
+        assert!(out.starts_with("aaa bbb ccc ddd eee\n"));
+        for line in out.lines().skip(1) {
+            assert!(line.width() <= 12, "line too wide: {line:?}");
+        }
     }
 }

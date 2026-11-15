@@ -35,6 +35,8 @@ Exit codes: `0` on success, `2` on usage errors, `141` when the reader
 | `--color[=WHEN]`    | Force colors. `WHEN`: `always` (default for this flag), `never`, `auto` (TTY with no `NO_COLOR`) |
 | `--no-color`        | Disable ANSI colors (same as `--color=never`)                       |
 | `-w, --width N`     | Wrap output at N display columns; no wrapping by default            |
+| `--table-width N`   | Fit tables in N display columns, overriding `--width` for tables    |
+| `--code-width N`    | Wrap code blocks at N display columns, overriding `--width` for code |
 | `-h, --help`        | Show help                                                           |
 | `-V, --version`     | Show version                                                        |
 
@@ -66,6 +68,35 @@ Piping the output or setting `NO_COLOR` turns colors off.
 
   A table narrower than N stays at its natural width; the rule still
   spans the full line.
+
+### Table width (`--table-width N`)
+
+Sets the shrink-fit budget for tables independently of `--width`. It can
+be wider or narrower than `--width`, and works without it:
+
+```sh
+mdhl doc.md --width 80 --table-width 120   # prose at 80, tables up to 120
+mdhl doc.md --width 100 --table-width 60   # keep tables compact
+mdhl doc.md --table-width 80               # only tables are constrained
+```
+
+Gutters still count against the budget. Table rows are never wrapped by
+`--width`, so a table wider than `--width` keeps its borders intact.
+Horizontal rules keep following `--width`.
+
+### Code width (`--code-width N`)
+
+Sets the wrap width for fenced and indented code blocks (and their
+language caption) independently of `--width`, and falls back to `--width`
+when unset. Like `--table-width`, it can be wider or narrower than
+`--width`, and gutters count against it:
+
+```sh
+mdhl doc.md --width 80 --code-width 120   # don't break long code lines at 80
+mdhl doc.md --code-width 100              # wrap only code blocks
+```
+
+Inline code spans are prose and follow `--width`.
 
 ## Rendering
 
