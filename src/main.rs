@@ -612,9 +612,7 @@ impl<'w, W: Write> Emitter<'w, W> {
         if let Some(w) = self.widths.table() {
             let gutter = self.gutter_width();
             let overhead = 3 * widths.len() + 1;
-            let budget = w
-                .saturating_sub(gutter)
-                .saturating_sub(overhead) as i64;
+            let budget = w.saturating_sub(gutter).saturating_sub(overhead) as i64;
             let mut sum: i64 = widths.iter().map(|&x| x as i64).sum();
             while sum > budget {
                 let Some(mi) = widths
@@ -1348,7 +1346,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{render, Widths};
+    use super::{Widths, render};
     use unicode_width::UnicodeWidthStr;
 
     fn plain(md: &str) -> String {
@@ -1497,7 +1495,11 @@ mod tests {
             // SGR chunking when color is on; the stripped colored text must
             // be identical to plain and keep the same uniform line widths.
             let colored = String::from_utf8(render(md, true, all(w))).expect("utf8 output");
-            assert_eq!(strip_ansi(&colored), out, "w={w}: colored differs from plain");
+            assert_eq!(
+                strip_ansi(&colored),
+                out,
+                "w={w}: colored differs from plain"
+            );
             let is_table = |l: &str| l.contains('│') || l.contains('├');
             let table: Vec<&str> = out.lines().filter(|l| is_table(l)).collect();
             let ws: Vec<usize> = table.iter().map(|l| l.width()).collect();
@@ -1537,10 +1539,7 @@ mod tests {
         // With a width set the rule fills the available line; gutters count.
         assert_eq!(plain_w("---", 8), format!("{}\n", "─".repeat(8)));
         assert_eq!(plain_w("---", 120), format!("{}\n", "─".repeat(120)));
-        assert_eq!(
-            plain_w("> ---", 10),
-            format!("> {}\n", "─".repeat(8))
-        );
+        assert_eq!(plain_w("> ---", 10), format!("> {}\n", "─".repeat(8)));
         // Without a width the rule stays a fixed 40 columns.
         assert_eq!(plain("---"), format!("{}\n", "─".repeat(40)));
     }
@@ -1573,9 +1572,18 @@ mod tests {
             let mut w = Widths::default();
             *w.slot(flag) = Some(value);
             let expect = match value {
-                1 => Widths { all: Some(1), ..Default::default() },
-                2 => Widths { table: Some(2), ..Default::default() },
-                _ => Widths { code: Some(3), ..Default::default() },
+                1 => Widths {
+                    all: Some(1),
+                    ..Default::default()
+                },
+                2 => Widths {
+                    table: Some(2),
+                    ..Default::default()
+                },
+                _ => Widths {
+                    code: Some(3),
+                    ..Default::default()
+                },
             };
             assert_eq!(w, expect, "{arg}");
         }
@@ -1583,47 +1591,103 @@ mod tests {
 
     #[test]
     fn widths_fall_back_to_all() {
-        let w = Widths { all: Some(50), table: None, code: Some(70) };
+        let w = Widths {
+            all: Some(50),
+            table: None,
+            code: Some(70),
+        };
         assert_eq!(w.table(), Some(50));
         assert_eq!(w.code(), Some(70));
         assert_eq!(Widths::default().table(), None);
     }
 
     fn all(w: usize) -> Widths {
-        Widths { all: Some(w), ..Default::default() }
+        Widths {
+            all: Some(w),
+            ..Default::default()
+        }
     }
 
     fn plain_with(md: &str, widths: Widths) -> String {
         String::from_utf8(render(md, false, widths)).expect("utf8 output")
     }
 
-
     #[test]
     fn code_width_overrides_width_for_code_only() {
         let code = "```\nabcdefghij\n```";
         // Narrower than --width: code wraps at 6, as with --width 6.
-        assert_eq!(plain_with(code, Widths { all: Some(80), code: Some(6), ..Default::default() }), plain_w(code, 6));
+        assert_eq!(
+            plain_with(
+                code,
+                Widths {
+                    all: Some(80),
+                    code: Some(6),
+                    ..Default::default()
+                }
+            ),
+            plain_w(code, 6)
+        );
         // Wider than --width: code lines are left whole.
-        assert_eq!(plain_with(code, Widths { all: Some(6), code: Some(80), ..Default::default() }), "│ abcdefghij\n");
+        assert_eq!(
+            plain_with(
+                code,
+                Widths {
+                    all: Some(6),
+                    code: Some(80),
+                    ..Default::default()
+                }
+            ),
+            "│ abcdefghij\n"
+        );
         // Prose still follows --width.
-        assert_eq!(plain_with("aaa bbb ccc", Widths { all: Some(7), code: Some(80), ..Default::default() }), "aaa bbb\nccc\n");
+        assert_eq!(
+            plain_with(
+                "aaa bbb ccc",
+                Widths {
+                    all: Some(7),
+                    code: Some(80),
+                    ..Default::default()
+                }
+            ),
+            "aaa bbb\nccc\n"
+        );
         // Without --width only code wraps.
         let md = "aaa bbb ccc ddd\n\n```\nabcdefghij\n```";
-        assert_eq!(plain_with(md, Widths { code: Some(6), ..Default::default() }), "aaa bbb ccc ddd\n\n│ abcd\n│ efgh\n│ ij\n");
+        assert_eq!(
+            plain_with(
+                md,
+                Widths {
+                    code: Some(6),
+                    ..Default::default()
+                }
+            ),
+            "aaa bbb ccc ddd\n\n│ abcd\n│ efgh\n│ ij\n"
+        );
     }
 
     #[test]
     fn long_code_caption_wraps_without_code_border() {
         // Wrapped caption lines keep the caption's prefix (no `│ `) and stay
         // within the code width, at top level and inside a blockquote.
-        let code = |md| plain_with(md, Widths { code: Some(8), ..Default::default() });
+        let code = |md| {
+            plain_with(
+                md,
+                Widths {
+                    code: Some(8),
+                    ..Default::default()
+                },
+            )
+        };
         assert_eq!(
             code("```verylonglanguagename\nabc\n```\n"),
             "verylong\nlanguage\nname\n│ abc\n"
         );
         let quoted = plain_with(
             "> ```verylonglanguagename\n> abc\n> ```\n",
-            Widths { code: Some(10), ..Default::default() },
+            Widths {
+                code: Some(10),
+                ..Default::default()
+            },
         );
         assert_eq!(quoted, "> verylong\n  language\n  name\n> │ abc\n");
     }
@@ -1635,7 +1699,10 @@ mod tests {
         assert_eq!(width_flag("--width=5"), Some(("--width", Some("5"))));
         assert_eq!(width_flag("-w"), Some(("--width", None)));
         assert_eq!(width_flag("-w5"), Some(("--width", Some("5"))));
-        assert_eq!(width_flag("--table-width=9"), Some(("--table-width", Some("9"))));
+        assert_eq!(
+            width_flag("--table-width=9"),
+            Some(("--table-width", Some("9")))
+        );
         assert_eq!(width_flag("--code-width"), Some(("--code-width", None)));
         assert_eq!(width_flag("--widthx"), None);
         assert_eq!(width_flag("--color"), None);
@@ -1645,20 +1712,66 @@ mod tests {
     fn table_width_overrides_width_for_tables_only() {
         let table = "| aaaa | bbbb |\n|------|------|\n| 1111 | 2222 |";
         // Narrower than --width: the table shrinks to 12, as with --width 12.
-        assert_eq!(plain_with(table, Widths { all: Some(80), table: Some(12), ..Default::default() }), plain_w(table, 12));
+        assert_eq!(
+            plain_with(
+                table,
+                Widths {
+                    all: Some(80),
+                    table: Some(12),
+                    ..Default::default()
+                }
+            ),
+            plain_w(table, 12)
+        );
         // Wider than --width: the table keeps its natural width and its
         // borders are not wrapped by the global width.
-        assert_eq!(plain_with(table, Widths { all: Some(8), table: Some(80), ..Default::default() }), plain(table));
+        assert_eq!(
+            plain_with(
+                table,
+                Widths {
+                    all: Some(8),
+                    table: Some(80),
+                    ..Default::default()
+                }
+            ),
+            plain(table)
+        );
         // Paragraphs and rules still follow --width.
-        assert_eq!(plain_with("aaa bbb ccc", Widths { all: Some(7), table: Some(80), ..Default::default() }), "aaa bbb\nccc\n");
-        assert_eq!(plain_with("---", Widths { all: Some(8), table: Some(80), ..Default::default() }), format!("{}\n", "─".repeat(8)));
+        assert_eq!(
+            plain_with(
+                "aaa bbb ccc",
+                Widths {
+                    all: Some(7),
+                    table: Some(80),
+                    ..Default::default()
+                }
+            ),
+            "aaa bbb\nccc\n"
+        );
+        assert_eq!(
+            plain_with(
+                "---",
+                Widths {
+                    all: Some(8),
+                    table: Some(80),
+                    ..Default::default()
+                }
+            ),
+            format!("{}\n", "─".repeat(8))
+        );
     }
 
     #[test]
     fn table_width_without_width() {
         // Tables fit the budget while other text stays unwrapped.
         let md = "aaa bbb ccc ddd eee\n\n| aaaa | bbbb |\n|------|------|\n| 1111 | 2222 |";
-        let out = plain_with(md, Widths { table: Some(12), ..Default::default() });
+        let out = plain_with(
+            md,
+            Widths {
+                table: Some(12),
+                ..Default::default()
+            },
+        );
         assert!(out.starts_with("aaa bbb ccc ddd eee\n"));
         for line in out.lines().skip(1) {
             assert!(line.width() <= 12, "line too wide: {line:?}");
