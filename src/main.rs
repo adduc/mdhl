@@ -157,6 +157,9 @@ struct Emitter<'w, W: Write> {
     link_brackets: bool,
     /// Language tag of the current code block, not yet printed.
     code_lang: Option<String>,
+    /// The code-block caption is being written: wrapped caption lines keep
+    /// the caption's prefix (outer gutters only, no code border).
+    in_caption: bool,
     /// A footnote-definition paragraph continues on its label line.
     after_label: bool,
     /// Output width limits (global, tables, code blocks).
@@ -187,6 +190,7 @@ impl<'w, W: Write> Emitter<'w, W> {
             link_url: String::new(),
             link_brackets: false,
             code_lang: None,
+            in_caption: false,
             after_label: false,
             widths,
             col: 0,
@@ -236,19 +240,7 @@ impl<'w, W: Write> Emitter<'w, W> {
     /// `new_block` re-opens quote and code gutters so each new paragraph or
     /// code line gets its own `>` / `│`.
     fn begin_line(&mut self, new_block: bool) {
-        let mut gap = false;
-        if self.line_has_content {
-            let _ = self.w.write_all(b"\n");
-            gap = self.top_gap;
-            self.line_has_content = false;
-            self.col = 0;
-            self.pending_sp = 0;
-        }
-        self.top_gap = false;
-        if gap {
-            let _ = self.w.write_all(b"\n");
-        }
-        self.begin_line_impl(new_block, false);
+        self.begin_line_impl(new_block, self.in_caption);
     }
 
     /// Line prefix for a code-block language caption: outer gutters only,
@@ -443,6 +435,7 @@ impl<'w, W: Write> Emitter<'w, W> {
         if let Some(lang) = self.code_lang.take() {
             if !lang.is_empty() {
                 self.begin_caption();
+                self.in_caption = true;
                 self.wrap_at(
                     &lang,
                     Some(Style {
@@ -453,6 +446,7 @@ impl<'w, W: Write> Emitter<'w, W> {
                     }),
                     width,
                 );
+                self.in_caption = false;
             }
         }
         let segs: Vec<&str> = text.split('\n').collect();
@@ -1602,26 +1596,35 @@ mod tests {
         String::from_utf8(render(md, false, widths)).expect("utf8 output")
     }
 
-    fn plain_tw(md: &str, width: Option<usize>, table_width: usize) -> String {
-        plain_with(md, Widths { all: width, table: Some(table_width), code: None })
-    }
-
-    fn plain_cw(md: &str, width: Option<usize>, code_width: usize) -> String {
-        plain_with(md, Widths { all: width, table: None, code: Some(code_width) })
-    }
 
     #[test]
     fn code_width_overrides_width_for_code_only() {
         let code = "```\nabcdefghij\n```";
         // Narrower than --width: code wraps at 6, as with --width 6.
-        assert_eq!(plain_cw(code, Some(80), 6), plain_w(code, 6));
+        assert_eq!(plain_with(code, Widths { all: Some(80), code: Some(6), ..Default::default() }), plain_w(code, 6));
         // Wider than --width: code lines are left whole.
-        assert_eq!(plain_cw(code, Some(6), 80), "│ abcdefghij\n");
+        assert_eq!(plain_with(code, Widths { all: Some(6), code: Some(80), ..Default::default() }), "│ abcdefghij\n");
         // Prose still follows --width.
-        assert_eq!(plain_cw("aaa bbb ccc", Some(7), 80), "aaa bbb\nccc\n");
+        assert_eq!(plain_with("aaa bbb ccc", Widths { all: Some(7), code: Some(80), ..Default::default() }), "aaa bbb\nccc\n");
         // Without --width only code wraps.
         let md = "aaa bbb ccc ddd\n\n```\nabcdefghij\n```";
-        assert_eq!(plain_cw(md, None, 6), "aaa bbb ccc ddd\n\n│ abcd\n│ efgh\n│ ij\n");
+        assert_eq!(plain_with(md, Widths { code: Some(6), ..Default::default() }), "aaa bbb ccc ddd\n\n│ abcd\n│ efgh\n│ ij\n");
+    }
+
+    #[test]
+    fn long_code_caption_wraps_without_code_border() {
+        // Wrapped caption lines keep the caption's prefix (no `│ `) and stay
+        // within the code width, at top level and inside a blockquote.
+        let code = |md| plain_with(md, Widths { code: Some(8), ..Default::default() });
+        assert_eq!(
+            code("```verylonglanguagename\nabc\n```\n"),
+            "verylong\nlanguage\nname\n│ abc\n"
+        );
+        let quoted = plain_with(
+            "> ```verylonglanguagename\n> abc\n> ```\n",
+            Widths { code: Some(10), ..Default::default() },
+        );
+        assert_eq!(quoted, "> verylong\n  language\n  name\n> │ abc\n");
     }
 
     #[test]
@@ -1641,20 +1644,20 @@ mod tests {
     fn table_width_overrides_width_for_tables_only() {
         let table = "| aaaa | bbbb |\n|------|------|\n| 1111 | 2222 |";
         // Narrower than --width: the table shrinks to 12, as with --width 12.
-        assert_eq!(plain_tw(table, Some(80), 12), plain_w(table, 12));
+        assert_eq!(plain_with(table, Widths { all: Some(80), table: Some(12), ..Default::default() }), plain_w(table, 12));
         // Wider than --width: the table keeps its natural width and its
         // borders are not wrapped by the global width.
-        assert_eq!(plain_tw(table, Some(8), 80), plain(table));
+        assert_eq!(plain_with(table, Widths { all: Some(8), table: Some(80), ..Default::default() }), plain(table));
         // Paragraphs and rules still follow --width.
-        assert_eq!(plain_tw("aaa bbb ccc", Some(7), 80), "aaa bbb\nccc\n");
-        assert_eq!(plain_tw("---", Some(8), 80), format!("{}\n", "─".repeat(8)));
+        assert_eq!(plain_with("aaa bbb ccc", Widths { all: Some(7), table: Some(80), ..Default::default() }), "aaa bbb\nccc\n");
+        assert_eq!(plain_with("---", Widths { all: Some(8), table: Some(80), ..Default::default() }), format!("{}\n", "─".repeat(8)));
     }
 
     #[test]
     fn table_width_without_width() {
         // Tables fit the budget while other text stays unwrapped.
         let md = "aaa bbb ccc ddd eee\n\n| aaaa | bbbb |\n|------|------|\n| 1111 | 2222 |";
-        let out = plain_tw(md, None, 12);
+        let out = plain_with(md, Widths { table: Some(12), ..Default::default() });
         assert!(out.starts_with("aaa bbb ccc ddd eee\n"));
         for line in out.lines().skip(1) {
             assert!(line.width() <= 12, "line too wide: {line:?}");
