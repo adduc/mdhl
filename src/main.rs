@@ -1395,14 +1395,31 @@ fn config_search(var: impl Fn(&str) -> Option<OsString>) -> ConfigSearch {
 }
 
 /// Split config text into arguments: whitespace-separated, with blank
-/// lines and lines starting with `#` ignored.
+/// lines ignored. A word starting with `#` begins a comment that runs to
+/// the end of its line, so both whole-line and trailing comments work. A
+/// leading UTF-8 byte-order mark, as some editors write, is ignored.
 fn config_args(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.starts_with('#'))
-        .flat_map(str::split_whitespace)
+    text.trim_start_matches('\u{feff}')
+        .lines()
+        .flat_map(|line| {
+            line.split_whitespace()
+                .take_while(|word| !word.starts_with('#'))
+        })
         .map(String::from)
         .collect()
+}
+
+/// Whether a read error on an optional (searched-for) config path means
+/// "no config here" rather than a broken config. A stray file or folder
+/// in the way, or a system config the user can't read, shouldn't stop
+/// every run; an explicit `$MDHL_CONFIG` never gets here.
+fn skippable_config_error(path: &std::path::Path, kind: io::ErrorKind) -> bool {
+    use io::ErrorKind::*;
+    match kind {
+        NotFound | NotADirectory | IsADirectory => true,
+        PermissionDenied => path == std::path::Path::new(SYSTEM_CONFIG),
+        _ => false,
+    }
 }
 
 /// Read the first existing config file: its path and arguments, or
@@ -1411,7 +1428,7 @@ fn load_config(search: &ConfigSearch) -> Result<Option<(PathBuf, Vec<String>)>, 
     for path in &search.paths {
         match std::fs::read_to_string(path) {
             Ok(text) => return Ok(Some((path.clone(), config_args(&text)))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound && !search.required => continue,
+            Err(e) if !search.required && skippable_config_error(path, e.kind()) => continue,
             Err(e) => return Err(format!("cannot read config {}: {e}", path.display())),
         }
     }
@@ -1961,6 +1978,36 @@ mod tests {
             super::config_args(text),
             args("--width 80 --table-width=120 --color")
         );
+    }
+
+    #[test]
+    fn config_args_trailing_comments_and_bom() {
+        let text = "\u{feff}-w 80   # wrap prose\n--color # always\n#--no-config\na#b\n";
+        assert_eq!(super::config_args(text), args("-w 80 --color a#b"));
+    }
+
+    #[test]
+    fn optional_config_skips_paths_that_are_not_files() {
+        use super::{ConfigSearch, load_config};
+        let dir = std::env::temp_dir().join(format!("mdhl-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("isdir")).unwrap();
+        std::fs::write(dir.join("file"), "").unwrap();
+        std::fs::write(dir.join("real"), "-w 70\n").unwrap();
+        let search = |required| ConfigSearch {
+            paths: vec![
+                dir.join("missing"),
+                dir.join("file").join("config"), // parent is a file: NotADirectory
+                dir.join("isdir"),               // IsADirectory
+                dir.join("real"),
+            ],
+            required,
+        };
+        let found = load_config(&search(false)).expect("optional paths are skipped");
+        assert_eq!(found, Some((dir.join("real"), args("-w 70"))));
+        // An explicit config path still fails loudly.
+        assert!(load_config(&search(true)).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
