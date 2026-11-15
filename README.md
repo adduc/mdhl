@@ -37,6 +37,10 @@ Exit codes: `0` on success, `2` on usage errors, `141` when the reader
 | `-w, --width N`     | Wrap output at N display columns; no wrapping by default            |
 | `--table-width N`   | Fit tables in N display columns, overriding `--width` for tables    |
 | `--code-width N`    | Wrap code blocks at N display columns, overriding `--width` for code |
+| `--no-width`        | Remove the `--width` limit (e.g. one set in the config)             |
+| `--no-table-width`  | Don't limit table width, even when `--width` is set                 |
+| `--no-code-width`   | Don't wrap code blocks, even when `--width` is set                  |
+| `--no-config`       | Ignore the config file                                              |
 | `-h, --help`        | Show help                                                           |
 | `-V, --version`     | Show version                                                        |
 
@@ -100,6 +104,38 @@ mdhl doc.md --code-width 100              # wrap only code blocks
 ```
 
 Inline code spans are prose and follow `--width`.
+
+## Config file
+
+Default options are read from the first of these files that exists:
+
+1. `$MDHL_CONFIG` — if set, the only file tried, and it must exist
+2. `$XDG_CONFIG_HOME/mdhl/config` (default `~/.config/mdhl/config`)
+3. `/etc/mdhl/config` — system-wide fallback
+
+The file holds options exactly as on the command line, separated by
+whitespace or newlines. Lines starting with `#` are comments.
+
+```text
+# ~/.config/mdhl/config
+-w 80
+--table-width 120
+--code-width 120
+--color
+```
+
+Command-line options are applied after the config, so they win:
+`--width 60` replaces the configured width, `--no-width` /
+`--no-table-width` / `--no-code-width` remove a configured limit, and
+`--color=auto` / `--no-color` undo a configured `--color`. `--no-config`
+skips the file entirely.
+
+A config may only set options: `FILE`, `--help`, `--version`, and
+`--no-config` are rejected. A config file that is unreadable or contains an
+invalid option is an error (exit `2`) naming the file. A missing file is
+skipped, except for an explicit `$MDHL_CONFIG`. Command-line errors and
+`--help` are reported before the config is read, so a broken config
+never hides them.
 
 ## Rendering
 

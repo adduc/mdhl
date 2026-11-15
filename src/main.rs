@@ -7,10 +7,16 @@
 
 //! Width: `--width N` wraps all output to at most N display columns;
 //! `--table-width N` and `--code-width N` override it for tables and code
-//! blocks.
+//! blocks; `--no-width` & co. remove a limit.
+//!
+//! Config: default options come from the first existing file among
+//! `$MDHL_CONFIG`, `$XDG_CONFIG_HOME/mdhl/config` and `/etc/mdhl/config`,
+//! in command-line syntax; the command line overrides them.
 
 use std::env;
+use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use pulldown_cmark::{
@@ -1113,29 +1119,31 @@ fn handle_event<W: Write>(em: &mut Emitter<W>, ev: &Event<'_>) {
 struct Widths {
     /// Everything (`--width`).
     all: Option<usize>,
-    /// Tables (`--table-width`); falls back to `all`.
-    table: Option<usize>,
-    /// Code blocks (`--code-width`); falls back to `all`.
-    code: Option<usize>,
+    /// Tables (`--table-width`): `None` falls back to `all`; `Some(None)`
+    /// (`--no-table-width`) means unlimited regardless of `all`.
+    table: Option<Option<usize>>,
+    /// Code blocks (`--code-width`), with the same fallback as `table`.
+    code: Option<Option<usize>>,
 }
 
 impl Widths {
     /// Effective table budget: `--table-width`, else `--width`.
     fn table(&self) -> Option<usize> {
-        self.table.or(self.all)
+        self.table.unwrap_or(self.all)
     }
 
     /// Effective code-block wrap width: `--code-width`, else `--width`.
     fn code(&self) -> Option<usize> {
-        self.code.or(self.all)
+        self.code.unwrap_or(self.all)
     }
 
-    /// The field a width option (by canonical name) sets.
-    fn slot(&mut self, flag: &str) -> &mut Option<usize> {
+    /// Set the limit for a width option (by canonical name); `None` is the
+    /// `--no-…` form.
+    fn set(&mut self, flag: &str, limit: Option<usize>) {
         match flag {
-            "--table-width" => &mut self.table,
-            "--code-width" => &mut self.code,
-            _ => &mut self.all,
+            "--table-width" => self.table = Some(limit),
+            "--code-width" => self.code = Some(limit),
+            _ => self.all = limit,
         }
     }
 }
@@ -1194,23 +1202,34 @@ Reads Markdown from FILE, or from stdin when omitted, and writes a
 highlighted rendering to stdout.
 
 Options:
-  --color[=WHEN]   Force colors. WHEN: always (default for this flag),
-                   never, auto (TTY + no NO_COLOR)
-  --no-color       Disable ANSI colors (same as --color=never)
-  -w, --width N    Wrap output at N display columns; no wrapping by default
-  --table-width N  Fit tables in N display columns, overriding --width
-                   for tables only (wider or narrower)
-  --code-width N   Wrap code blocks at N display columns, overriding
-                   --width for code blocks only (wider or narrower)
-  -h, --help       Show this help
-  -V, --version    Show version
+  --color[=WHEN]      Force colors. WHEN: always (default for this flag),
+                      never, auto (TTY + no NO_COLOR)
+  --no-color          Disable ANSI colors (same as --color=never)
+  -w, --width N       Wrap output at N display columns; no wrapping by default
+  --table-width N     Fit tables in N display columns, overriding --width
+                      for tables only (wider or narrower)
+  --code-width N      Wrap code blocks at N display columns, overriding
+                      --width for code blocks only (wider or narrower)
+  --no-width, --no-table-width, --no-code-width
+                      Remove that width limit (e.g. one set in the config)
+  --no-config         Ignore the config file
+  -h, --help          Show this help
+  -V, --version       Show version
+
+Config: default options are read from the first of $MDHL_CONFIG,
+$XDG_CONFIG_HOME/mdhl/config (~/.config/mdhl/config), /etc/mdhl/config
+that exists. It holds options as on the command line, whitespace- or
+line-separated; `#` starts a comment line. Command-line options win.
 ";
+
+/// System-wide config, used when no user config exists.
+const SYSTEM_CONFIG: &str = "/etc/mdhl/config";
 
 fn parse_width(flag: &str, v: &str) -> Result<usize, String> {
     match v.parse::<usize>() {
         Ok(n) if n > 0 => Ok(n),
         _ => Err(format!(
-            "mdhl: invalid {flag} value: {v} (expected a positive integer)"
+            "invalid {flag} value: {v} (expected a positive integer)"
         )),
     }
 }
@@ -1233,39 +1252,80 @@ fn width_flag(a: &str) -> Option<(&'static str, Option<&str>)> {
     }
 }
 
-fn main() -> ExitCode {
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    let mut color: Option<bool> = None;
-    let mut widths = Widths::default();
-    let mut file: Option<String> = None;
+/// Recognize `--no-width` & co.: returns the width option it clears.
+fn no_width_flag(a: &str) -> Option<&'static str> {
+    match a {
+        "--no-width" => Some("--width"),
+        "--no-table-width" => Some("--table-width"),
+        "--no-code-width" => Some("--code-width"),
+        _ => None,
+    }
+}
 
+/// Settings gathered from the config file and the command line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Opts {
+    /// `None` = auto (TTY and no `NO_COLOR`).
+    color: Option<bool>,
+    widths: Widths,
+    file: Option<String>,
+    no_config: bool,
+}
+
+/// What `main` should do once arguments are parsed.
+#[derive(Debug, PartialEq, Eq)]
+enum Flow {
+    Run,
+    Help,
+    Version,
+}
+
+#[derive(Debug)]
+struct ArgError {
+    msg: String,
+    /// Follow the message with the help text (unknown options).
+    show_help: bool,
+}
+
+impl From<String> for ArgError {
+    fn from(msg: String) -> Self {
+        ArgError {
+            msg,
+            show_help: false,
+        }
+    }
+}
+
+/// Apply `args` to `opts`, later options overriding earlier ones.
+/// `cli` is false for config-file arguments, which may only set option
+/// defaults: no FILE, `--help`, `--version`, or `--no-config`.
+fn parse_args(args: &[String], opts: &mut Opts, cli: bool) -> Result<Flow, ArgError> {
     let mut i = 0usize;
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "-h" | "--help" => {
-                print!("{HELP}");
-                return ExitCode::SUCCESS;
+            "-h" | "--help" | "-V" | "--version" | "--no-config" if !cli => {
+                return Err(format!("{a} is not allowed in a config file").into());
             }
-            "-V" | "--version" => {
-                println!("mdhl {}", env!("CARGO_PKG_VERSION"));
-                return ExitCode::SUCCESS;
-            }
-            "--no-color" => color = Some(false),
-            "--color" => color = Some(true),
+            "-h" | "--help" => return Ok(Flow::Help),
+            "-V" | "--version" => return Ok(Flow::Version),
+            "--no-config" => opts.no_config = true,
+            "--no-color" => opts.color = Some(false),
+            "--color" => opts.color = Some(true),
             s if s.starts_with("--color=") => {
-                color = match &s["--color=".len()..] {
+                opts.color = match &s["--color=".len()..] {
                     "always" => Some(true),
                     "never" => Some(false),
                     "auto" => None,
                     other => {
-                        eprintln!(
-                            "mdhl: invalid --color value: {other} (expected always, never, or auto)"
-                        );
-                        return ExitCode::from(2);
+                        return Err(format!(
+                            "invalid --color value: {other} (expected always, never, or auto)"
+                        )
+                        .into());
                     }
                 };
             }
+            _ if let Some(flag) = no_width_flag(a) => opts.widths.set(flag, None),
             _ if let Some((flag, inline)) = width_flag(a) => {
                 let v = match inline {
                     Some(v) => v,
@@ -1273,41 +1333,141 @@ fn main() -> ExitCode {
                         i += 1;
                         match args.get(i) {
                             Some(v) => v.as_str(),
-                            None => {
-                                eprintln!("mdhl: {flag} requires a value");
-                                return ExitCode::from(2);
-                            }
+                            None => return Err(format!("{flag} requires a value").into()),
                         }
                     }
                 };
-                match parse_width(flag, v) {
-                    Ok(n) => *widths.slot(flag) = Some(n),
-                    Err(msg) => {
-                        eprintln!("{msg}");
-                        return ExitCode::from(2);
-                    }
-                }
+                opts.widths.set(flag, Some(parse_width(flag, v)?));
             }
             s if s.starts_with('-') && s != "-" => {
-                eprintln!("mdhl: unknown option: {a}");
-                eprint!("{HELP}");
-                return ExitCode::from(2);
+                return Err(ArgError {
+                    msg: format!("unknown option: {a}"),
+                    show_help: cli,
+                });
+            }
+            _ if !cli => {
+                return Err(format!(
+                    "unexpected argument: {a} (FILE can't be set in a config file)"
+                )
+                .into());
             }
             _ => {
-                if file.is_some() {
-                    eprintln!("mdhl: unexpected argument: {a}");
-                    return ExitCode::from(2);
+                if opts.file.is_some() {
+                    return Err(format!("unexpected argument: {a}").into());
                 }
-                file = Some(a.to_string());
+                opts.file = Some(a.to_string());
             }
         }
         i += 1;
     }
+    Ok(Flow::Run)
+}
 
-    let color =
-        color.unwrap_or_else(|| io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none());
+/// Config files to try, in order; the first that exists is used. When
+/// `required`, the (single) path was named explicitly and must exist.
+struct ConfigSearch {
+    paths: Vec<PathBuf>,
+    required: bool,
+}
 
-    let input = match &file {
+fn config_search(var: impl Fn(&str) -> Option<OsString>) -> ConfigSearch {
+    let set = |name: &str| var(name).filter(|v| !v.is_empty());
+    if let Some(p) = set("MDHL_CONFIG") {
+        return ConfigSearch {
+            paths: vec![PathBuf::from(p)],
+            required: true,
+        };
+    }
+    let mut paths = Vec::new();
+    // Per the XDG spec, a relative XDG_CONFIG_HOME is invalid and ignored.
+    let user_dir = set("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| set("HOME").map(|h| PathBuf::from(h).join(".config")));
+    if let Some(dir) = user_dir {
+        paths.push(dir.join("mdhl").join("config"));
+    }
+    paths.push(PathBuf::from(SYSTEM_CONFIG));
+    ConfigSearch {
+        paths,
+        required: false,
+    }
+}
+
+/// Split config text into arguments: whitespace-separated, with blank
+/// lines and lines starting with `#` ignored.
+fn config_args(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .flat_map(str::split_whitespace)
+        .map(String::from)
+        .collect()
+}
+
+/// Read the first existing config file: its path and arguments, or
+/// `None` if there is none.
+fn load_config(search: &ConfigSearch) -> Result<Option<(PathBuf, Vec<String>)>, String> {
+    for path in &search.paths {
+        match std::fs::read_to_string(path) {
+            Ok(text) => return Ok(Some((path.clone(), config_args(&text)))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !search.required => continue,
+            Err(e) => return Err(format!("cannot read config {}: {e}", path.display())),
+        }
+    }
+    Ok(None)
+}
+
+fn main() -> ExitCode {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+
+    // The command line is validated on its own first, so `--help` and
+    // usage errors never depend on the config file.
+    let mut opts = Opts::default();
+    match parse_args(&args, &mut opts, true) {
+        Ok(Flow::Run) => {}
+        Ok(Flow::Help) => {
+            print!("{HELP}");
+            return ExitCode::SUCCESS;
+        }
+        Ok(Flow::Version) => {
+            println!("mdhl {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("mdhl: {}", e.msg);
+            if e.show_help {
+                eprint!("{HELP}");
+            }
+            return ExitCode::from(2);
+        }
+    }
+
+    if !opts.no_config {
+        match load_config(&config_search(|k| env::var_os(k))) {
+            Ok(None) => {}
+            Ok(Some((path, config))) => {
+                // Config first, then the command line on top of it.
+                let mut merged = Opts::default();
+                if let Err(e) = parse_args(&config, &mut merged, false) {
+                    eprintln!("mdhl: {}: {}", path.display(), e.msg);
+                    return ExitCode::from(2);
+                }
+                parse_args(&args, &mut merged, true).expect("command line already validated");
+                opts = merged;
+            }
+            Err(msg) => {
+                eprintln!("mdhl: {msg}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let color = opts
+        .color
+        .unwrap_or_else(|| io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none());
+
+    let input = match &opts.file {
         Some(path) => match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
@@ -1325,7 +1485,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let out = render(&input, color, widths);
+    let out = render(&input, color, opts.widths);
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     if let Err(e) = handle.write_all(&out) {
@@ -1570,18 +1730,18 @@ mod tests {
         ] {
             let (flag, _) = super::width_flag(arg).unwrap();
             let mut w = Widths::default();
-            *w.slot(flag) = Some(value);
+            w.set(flag, Some(value));
             let expect = match value {
                 1 => Widths {
                     all: Some(1),
                     ..Default::default()
                 },
                 2 => Widths {
-                    table: Some(2),
+                    table: Some(Some(2)),
                     ..Default::default()
                 },
                 _ => Widths {
-                    code: Some(3),
+                    code: Some(Some(3)),
                     ..Default::default()
                 },
             };
@@ -1594,7 +1754,7 @@ mod tests {
         let w = Widths {
             all: Some(50),
             table: None,
-            code: Some(70),
+            code: Some(Some(70)),
         };
         assert_eq!(w.table(), Some(50));
         assert_eq!(w.code(), Some(70));
@@ -1621,7 +1781,7 @@ mod tests {
                 code,
                 Widths {
                     all: Some(80),
-                    code: Some(6),
+                    code: Some(Some(6)),
                     ..Default::default()
                 }
             ),
@@ -1633,7 +1793,7 @@ mod tests {
                 code,
                 Widths {
                     all: Some(6),
-                    code: Some(80),
+                    code: Some(Some(80)),
                     ..Default::default()
                 }
             ),
@@ -1645,7 +1805,7 @@ mod tests {
                 "aaa bbb ccc",
                 Widths {
                     all: Some(7),
-                    code: Some(80),
+                    code: Some(Some(80)),
                     ..Default::default()
                 }
             ),
@@ -1657,7 +1817,7 @@ mod tests {
             plain_with(
                 md,
                 Widths {
-                    code: Some(6),
+                    code: Some(Some(6)),
                     ..Default::default()
                 }
             ),
@@ -1673,7 +1833,7 @@ mod tests {
             plain_with(
                 md,
                 Widths {
-                    code: Some(8),
+                    code: Some(Some(8)),
                     ..Default::default()
                 },
             )
@@ -1685,7 +1845,7 @@ mod tests {
         let quoted = plain_with(
             "> ```verylonglanguagename\n> abc\n> ```\n",
             Widths {
-                code: Some(10),
+                code: Some(Some(10)),
                 ..Default::default()
             },
         );
@@ -1717,7 +1877,7 @@ mod tests {
                 table,
                 Widths {
                     all: Some(80),
-                    table: Some(12),
+                    table: Some(Some(12)),
                     ..Default::default()
                 }
             ),
@@ -1730,7 +1890,7 @@ mod tests {
                 table,
                 Widths {
                     all: Some(8),
-                    table: Some(80),
+                    table: Some(Some(80)),
                     ..Default::default()
                 }
             ),
@@ -1742,7 +1902,7 @@ mod tests {
                 "aaa bbb ccc",
                 Widths {
                     all: Some(7),
-                    table: Some(80),
+                    table: Some(Some(80)),
                     ..Default::default()
                 }
             ),
@@ -1753,7 +1913,7 @@ mod tests {
                 "---",
                 Widths {
                     all: Some(8),
-                    table: Some(80),
+                    table: Some(Some(80)),
                     ..Default::default()
                 }
             ),
@@ -1768,7 +1928,7 @@ mod tests {
         let out = plain_with(
             md,
             Widths {
-                table: Some(12),
+                table: Some(Some(12)),
                 ..Default::default()
             },
         );
@@ -1776,5 +1936,138 @@ mod tests {
         for line in out.lines().skip(1) {
             assert!(line.width() <= 12, "line too wide: {line:?}");
         }
+    }
+
+    // ---- config file / command-line merging ----
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    /// Parse `config` then `cli` the way `main` does.
+    fn merged(config: &str, cli: &str) -> super::Opts {
+        use super::{Opts, config_args, parse_args};
+        let mut o = Opts::default();
+        parse_args(&config_args(config), &mut o, false).expect("config parses");
+        parse_args(&args(cli), &mut o, true).expect("cli parses");
+        o
+    }
+
+    #[test]
+    fn config_args_split_lines_and_skip_comments() {
+        let text =
+            "# defaults\n--width 80\n\n  --table-width=120  \n   # indented comment\n--color\n";
+        assert_eq!(
+            super::config_args(text),
+            args("--width 80 --table-width=120 --color")
+        );
+    }
+
+    #[test]
+    fn command_line_overrides_config() {
+        let cfg = "-w 80\n--table-width 120\n--code-width 120\n--color";
+        let o = merged(cfg, "");
+        assert_eq!(o.color, Some(true));
+        assert_eq!(o.widths.all, Some(80));
+        assert_eq!(o.widths.table(), Some(120));
+        assert_eq!(o.widths.code(), Some(120));
+
+        let o = merged(cfg, "-w 60 --color=never doc.md");
+        assert_eq!(o.color, Some(false));
+        assert_eq!(o.widths.all, Some(60));
+        assert_eq!(o.widths.table(), Some(120));
+        assert_eq!(o.file.as_deref(), Some("doc.md"));
+
+        // --color=auto resets a forced color back to auto-detection.
+        assert_eq!(merged(cfg, "--color=auto").color, None);
+    }
+
+    #[test]
+    fn no_width_flags_remove_limits() {
+        let cfg = "-w 80 --table-width 120 --code-width 100";
+        let o = merged(cfg, "--no-width");
+        assert_eq!(o.widths.all, None);
+        assert_eq!(o.widths.table(), Some(120));
+        // --no-table-width means unlimited, not "follow --width".
+        let o = merged(cfg, "--no-table-width --no-code-width");
+        assert_eq!(o.widths.all, Some(80));
+        assert_eq!(o.widths.table(), None);
+        assert_eq!(o.widths.code(), None);
+        // A later width option sets the limit again.
+        assert_eq!(
+            merged(cfg, "--no-code-width --code-width 50").widths.code(),
+            Some(50)
+        );
+        // Without a config, --no-width keeps tables/code falling back.
+        assert_eq!(merged("", "--no-width").widths, Widths::default());
+    }
+
+    #[test]
+    fn config_rejects_cli_only_arguments() {
+        use super::{Opts, parse_args};
+        for bad in [
+            "--help",
+            "-V",
+            "--no-config",
+            "doc.md",
+            "--bogus",
+            "--width",
+        ] {
+            let err = parse_args(&args(bad), &mut Opts::default(), false).unwrap_err();
+            assert!(!err.show_help, "{bad}: config errors don't print help");
+            assert!(!err.msg.is_empty());
+        }
+        // The same help/version flags work on the command line.
+        let mut o = Opts::default();
+        assert_eq!(
+            parse_args(&args("--help"), &mut o, true).unwrap(),
+            super::Flow::Help
+        );
+        assert_eq!(
+            parse_args(&args("--no-config"), &mut o, true).unwrap(),
+            super::Flow::Run
+        );
+        assert!(o.no_config);
+    }
+
+    #[test]
+    fn config_search_order() {
+        use super::{SYSTEM_CONFIG, config_search};
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| OsString::from(v))
+            }
+        };
+        let paths = |v: &[&str]| v.iter().map(PathBuf::from).collect::<Vec<_>>();
+
+        let s = config_search(env(&[("XDG_CONFIG_HOME", "/x"), ("HOME", "/h")]));
+        assert_eq!(s.paths, paths(&["/x/mdhl/config", SYSTEM_CONFIG]));
+        assert!(!s.required);
+
+        // Unset, empty, or relative XDG_CONFIG_HOME falls back to ~/.config.
+        const FALLBACKS: [&[(&str, &str)]; 3] = [
+            &[("HOME", "/h")],
+            &[("XDG_CONFIG_HOME", ""), ("HOME", "/h")],
+            &[("XDG_CONFIG_HOME", "rel"), ("HOME", "/h")],
+        ];
+        for pairs in FALLBACKS {
+            assert_eq!(
+                config_search(env(pairs)).paths,
+                paths(&["/h/.config/mdhl/config", SYSTEM_CONFIG])
+            );
+        }
+
+        // No HOME at all: only the system config.
+        assert_eq!(config_search(env(&[])).paths, paths(&[SYSTEM_CONFIG]));
+
+        // MDHL_CONFIG replaces the search and must exist.
+        let s = config_search(env(&[("MDHL_CONFIG", "/c"), ("HOME", "/h")]));
+        assert_eq!(s.paths, paths(&["/c"]));
+        assert!(s.required);
     }
 }
