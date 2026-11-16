@@ -180,8 +180,8 @@ cargo run -- sample.md --width 80
 
 1. Bump the version in `Cargo.toml` and in `Version:` of
    `packaging/mdhl.spec`, and add a `%changelog` entry to the spec for
-   the new version. `packaging/check-version.sh` (also run in CI) checks
-   that all three agree.
+   the new version. `packaging/check-version.sh` (also run on every pull
+   request) checks that all three agree.
 
    For a pre-release, RPM writes the suffix with `~` instead of `-`: a
    Cargo version of `0.2.0-rc.1` is `Version: 0.2.0~rc.1` in the spec and

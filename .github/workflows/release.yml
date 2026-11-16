@@ -22,21 +22,30 @@ permissions:
   contents: read
 
 jobs:
-  version:
+  # Packaging metadata that has to agree with the code. CI doesn't repeat
+  # these, since this workflow runs on every pull request.
+  packaging:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       # On a tag, the tag must match too.
-      - run: packaging/check-version.sh ${TAG:+"$TAG"}
+      - name: Check the version
+        run: packaging/check-version.sh ${TAG:+"$TAG"}
         env:
           TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      - name: Check the spec's License
+        run: packaging/check-license.sh
 
   rpm:
-    needs: version
+    needs: packaging
     strategy:
       matrix:
-        # Keep in step with the list in the assemble job.
-        fedora: [44, 45]
+        # Keep in step with the list in the assemble job. The source RPM is
+        # the same for every release, so only the newest one ships it.
+        include:
+          - fedora: 44
+          - fedora: 45
+            srpm: true
     runs-on: ubuntu-24.04
     container: fedora:${{ matrix.fedora }}
     steps:
@@ -54,9 +63,15 @@ jobs:
       # debuginfo and debugsource are left out; they're only useful with a
       # debuginfo repository behind them.
       - name: Collect RPMs
+        env:
+          SRPM: ${{ matrix.srpm && 'true' || '' }}
         run: |
           mkdir dist
-          find target/rpmbuild/SRPMS target/rpmbuild/RPMS -name '*.rpm' \
+          dirs=(target/rpmbuild/RPMS)
+          if [ -n "$SRPM" ]; then
+            dirs+=(target/rpmbuild/SRPMS)
+          fi
+          find "${dirs[@]}" -name '*.rpm' \
               ! -name '*-debuginfo-*' ! -name '*-debugsource-*' \
               -exec cp {} dist/ \;
           ls -l dist
@@ -70,7 +85,7 @@ jobs:
   # Static musl binaries for every other distribution. Each architecture
   # builds natively on its own runner.
   tarball:
-    needs: version
+    needs: packaging
     strategy:
       matrix:
         include:
@@ -119,15 +134,12 @@ jobs:
       - name: Check the release files
         run: |
           version=$(packaging/version.sh)
-          rpm=$(packaging/version.sh --rpm)
-          release=$(sed -n 's/^Release: *//p' packaging/mdhl.spec | head -n1)
-          release=${release%%%\{?dist\}}
+          rpm=$(packaging/version.sh --rpm-release)
           {
             for fedora in 44 45; do
-              for arch in x86_64 src; do
-                echo "mdhl-$rpm-$release.fc$fedora.$arch.rpm"
-              done
+              echo "mdhl-$rpm.fc$fedora.x86_64.rpm"
             done
+            echo "mdhl-$rpm.fc45.src.rpm"
             for arch in x86_64 aarch64; do
               echo "mdhl-$version-$arch-linux.tar.gz"
             done

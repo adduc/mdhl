@@ -14,9 +14,8 @@ spec_file=packaging/mdhl.spec
 
 cargo=$(packaging/version.sh)
 rpm=$(packaging/version.sh --rpm)
+rpm_release=$(packaging/version.sh --rpm-release)
 spec=$(sed -n 's/^Version: *//p' "$spec_file" | head -n1)
-release=$(sed -n 's/^Release: *//p' "$spec_file" | head -n1)
-release=${release%%%\{?dist\}}
 # The first entry after %changelog ends in "- VERSION-RELEASE".
 changelog=$(sed -n '/^%changelog/,$ { /^\*/ { s/.* - *\([^ ]*\) *$/\1/p; q } }' "$spec_file")
 
@@ -34,9 +33,9 @@ if [ "$spec" != "$rpm" ]; then
         fail "$spec_file has Version '$spec', but Cargo.toml has '$cargo'"
     fi
 fi
-if [ "$changelog" != "$rpm-$release" ]; then
+if [ "$changelog" != "$rpm_release" ]; then
     fail "the newest %changelog entry in $spec_file is for" \
-        "'${changelog:-nothing}', but the package is '$rpm-$release';" \
+        "'${changelog:-nothing}', but the package is '$rpm_release';" \
         "add an entry for this release"
 fi
 if [ -n "${1:-}" ] && [ "${1#v}" != "$cargo" ]; then
@@ -44,6 +43,6 @@ if [ -n "${1:-}" ] && [ "${1#v}" != "$cargo" ]; then
 fi
 
 if [ $status -eq 0 ]; then
-    echo "version $cargo (RPM $rpm-$release) is consistent"
+    echo "version $cargo (RPM $rpm_release) is consistent"
 fi
 exit $status

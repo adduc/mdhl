@@ -5,10 +5,11 @@ on:
     branches: [main]
   pull_request:
 
-# Superseded runs on the same branch or PR are cancelled.
+# A newer push to a pull request cancels its older run. Runs on main are
+# never cancelled, so every merge commit gets a result.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,9 +43,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --locked
 
-  # Catches a missed bump before the release tag does.
-  version:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - run: packaging/check-version.sh
+# The version and license checks run in the Release workflow, which runs on
+# every pull request.

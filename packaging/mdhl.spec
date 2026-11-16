@@ -8,8 +8,8 @@ Release:        1%{?dist}
 Summary:        Highlight Markdown as ANSI-colored text on the terminal
 
 # mdhl is GPL-3.0-or-later; the rest covers the vendored crates, as listed
-# by %%cargo_license_summary during the build. Recheck it there when
-# dependencies change.
+# by %%cargo_license_summary during the build. packaging/check-license.sh
+# (run in CI) fails when a dependency change makes this stale.
 SourceLicense:  GPL-3.0-or-later
 License:        GPL-3.0-or-later AND MIT AND (MIT OR Apache-2.0) AND (Unlicense OR MIT)
 URL:            https://github.com/adduc/mdhl
