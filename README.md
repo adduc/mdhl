@@ -5,8 +5,67 @@ Parses with `pulldown-cmark`, renders to the terminal — no HTML, no pager.
 
 ## Build
 
+Needs Rust 1.95 or newer.
+
 ```sh
-cargo build --release
+make        # build a release binary (cargo build --release)
+make test   # run the tests
+```
+
+### Installing
+
+`make install` copies the binary to `~/.local/bin`; `make uninstall`
+removes it. For a system-wide install, set `PREFIX`, and build first so
+cargo doesn't run as root:
+
+```sh
+make
+sudo make install PREFIX=/usr/local
+```
+
+`DESTDIR` is supported for staged installs when packaging.
+
+### Prebuilt binaries
+
+Each [release](https://github.com/adduc/mdhl/releases) has:
+
+- RPMs for Fedora 44 and 45 (x86_64). Install the one matching your
+  release with dnf:
+
+  ```sh
+  sudo dnf install ./mdhl-*.fc$(rpm -E %fedora).x86_64.rpm
+  ```
+
+- A tarball with a statically linked binary for any other Linux
+  distribution, for x86_64 and aarch64. It needs no libraries, so it runs
+  on glibc and musl (Alpine) systems alike:
+
+  ```sh
+  v=X.Y.Z  # the release you downloaded
+  tar -xzf mdhl-$v-$(uname -m)-linux.tar.gz
+  install -Dm755 mdhl-$v-$(uname -m)-linux/mdhl ~/.local/bin/mdhl
+  ```
+
+`SHA256SUMS` lists the checksums of every file (`sha256sum -c --ignore-missing SHA256SUMS`).
+
+To build the tarball yourself, add the musl target and run `make dist`. It
+lands in `target/dist/`. Set `RUST_TARGET` to build for another
+architecture, e.g. `RUST_TARGET=aarch64-unknown-linux-musl`.
+
+```sh
+rustup target add $(uname -m)-unknown-linux-musl
+make dist
+```
+
+### Fedora RPM
+
+To build the RPMs yourself, install the packaging tools and run `make rpm`.
+The source tarball comes from `git archive`, so only committed changes are
+included. The RPMs land in `target/rpmbuild/`.
+
+```sh
+sudo dnf install rpm-build cargo-rpm-macros
+make rpm
 ```
 
 ## Usage
@@ -168,3 +227,37 @@ rendering feature.
 cargo test
 cargo run -- sample.md --width 80
 ```
+
+## Releasing
+
+1. Bump the version in `Cargo.toml` and in `Version:` of
+   `packaging/mdhl.spec`, and add a `%changelog` entry to the spec for
+   the new version. `packaging/check-version.sh` (also run on every pull
+   request) checks that all three agree.
+
+   For a pre-release, RPM writes the suffix with `~` instead of `-`: a
+   Cargo version of `0.2.0-rc.1` is `Version: 0.2.0~rc.1` in the spec and
+   in its changelog entry, and the tag is `v0.2.0-rc.1`. It's published as
+   a GitHub pre-release.
+2. Merge to `main`, then tag and push:
+
+   ```sh
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+The Release workflow builds the RPMs in Fedora 44 and 45 containers and
+the static tarballs for x86_64 and aarch64, then attaches them all, with a
+`SHA256SUMS` file, to a GitHub release for the tag. It stops if the tag
+doesn't match the version.
+
+Pull requests only run the version and License checks, not the release
+builds. To try a release before tagging, run the Release workflow by hand
+(`gh workflow run release.yml`, or from the Actions tab): it builds and
+assembles every release file, checksums included, without publishing.
+GitHub only offers a manual run for workflows on the default branch, so
+this works once the workflow is on `main`.
+
+## License
+
+GPL-3.0-or-later. See `LICENSE`.

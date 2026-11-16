@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to a pull request cancels its older run. On main each commit
+# gets a group of its own, so no run is cancelled or dropped from the queue
+# and every merge commit gets a result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  # Keep in step with `rust-version` in Cargo.toml. 1.95 is the first release
+  # with stable `if let` guards on match arms.
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --locked
+
+  # Packaging metadata that has to agree with the code. The Release workflow
+  # repeats these on a tag, where the tag must match the version too.
+  packaging:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # check-license.sh reads the dependency tree with cargo.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check the version
+        run: packaging/check-version.sh
+      - name: Check the spec's License
+        run: packaging/check-license.sh

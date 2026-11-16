@@ -1,0 +1,206 @@
+name: Release
+
+# Pushing a tag like v1.2.0 builds Fedora RPMs and static Linux tarballs and
+# attaches them to a GitHub release for that tag. Bump the version in
+# Cargo.toml and the spec file first; the build stops if they disagree.
+#
+# To try the release before tagging, run this workflow by hand from the
+# Actions tab: it builds and assembles every release file without
+# publishing. Only a tag uploads to GitHub.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Runs are never cancelled, so a release can't be left half published.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# What a release is built for. The build matrices and the check of the
+# release files all come from these, so this is the only place to edit.
+env:
+  # Fedora releases to build an RPM for. The source RPM is the same for
+  # every release, so only the last one listed ships it.
+  FEDORA_RELEASES: "44 45"
+  # Architectures to build a static tarball for, and the runner that builds
+  # each one natively.
+  TARBALL_RUNNERS: '{"x86_64": "ubuntu-24.04", "aarch64": "ubuntu-24.04-arm"}'
+
+jobs:
+  # Packaging metadata that has to agree with the code. CI runs the same
+  # checks on every pull request; here the tag must match too.
+  packaging:
+    runs-on: ubuntu-24.04
+    outputs:
+      fedora: ${{ steps.matrix.outputs.fedora }}
+      tarball: ${{ steps.matrix.outputs.tarball }}
+    steps:
+      - uses: actions/checkout@v7
+      # check-license.sh reads the dependency tree with cargo.
+      - uses: dtolnay/rust-toolchain@stable
+      # On a tag, the tag must match too.
+      - name: Check the version
+        run: packaging/check-version.sh ${TAG:+"$TAG"}
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      - name: Check the spec's License
+        run: packaging/check-license.sh
+
+      # A matrix can't read env, so the lists above reach it as outputs.
+      - name: Build the matrices
+        id: matrix
+        run: |
+          echo "fedora=$(jq -cn '$ARGS.positional' --args $FEDORA_RELEASES)" >> "$GITHUB_OUTPUT"
+          echo "tarball=$(jq -c 'to_entries | map({arch: .key, runner: .value})' <<< "$TARBALL_RUNNERS")" >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+  rpm:
+    needs: packaging
+    strategy:
+      matrix:
+        fedora: ${{ fromJSON(needs.packaging.outputs.fedora) }}
+    runs-on: ubuntu-24.04
+    container: fedora:${{ matrix.fedora }}
+    steps:
+      - name: Install build tools
+        run: dnf install -y git make rpm-build cargo-rpm-macros
+
+      - uses: actions/checkout@v7
+
+      # The checkout is owned by a different user than the container's root.
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - run: make rpm
+
+      # The source RPM carries the vendored crates, so it rebuilds offline.
+      # debuginfo and debugsource are left out; they're only useful with a
+      # debuginfo repository behind them.
+      - name: Collect RPMs
+        env:
+          FEDORA: ${{ matrix.fedora }}
+        run: |
+          mkdir dist
+          dirs=(target/rpmbuild/RPMS)
+          if [ "$FEDORA" = "${FEDORA_RELEASES##* }" ]; then
+            dirs+=(target/rpmbuild/SRPMS)
+          fi
+          find "${dirs[@]}" -name '*.rpm' \
+              ! -name '*-debuginfo-*' ! -name '*-debugsource-*' \
+              -exec cp {} dist/ \;
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rpm-fc${{ matrix.fedora }}
+          path: dist/
+          if-no-files-found: error
+
+  # Static musl binaries for every other distribution. Each architecture
+  # builds natively on its own runner.
+  tarball:
+    needs: packaging
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.packaging.outputs.tarball) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+
+      - run: make dist RUST_TARGET=${{ matrix.arch }}-unknown-linux-musl
+
+      # Fails if the binary picked up a dynamic loader.
+      - name: Check the binary is static and runs
+        run: |
+          bin=target/${{ matrix.arch }}-unknown-linux-musl/release/mdhl
+          file "$bin"
+          file "$bin" | grep -q 'static'
+          "$bin" --version
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: target/dist/*.tar.gz
+          if-no-files-found: error
+
+  # Gathers every build's output, checks it is exactly the set of files a
+  # release should carry, and adds SHA256SUMS. Runs on a manual run too, so
+  # all of the release except the upload can be tried before tagging.
+  assemble:
+    needs: [rpm, tarball]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check the release files
+        run: |
+          version=$(packaging/version.sh)
+          rpm=$(packaging/version.sh --rpm-release)
+          {
+            for fedora in $FEDORA_RELEASES; do
+              echo "mdhl-$rpm.fc$fedora.x86_64.rpm"
+            done
+            echo "mdhl-$rpm.fc${FEDORA_RELEASES##* }.src.rpm"
+            for arch in $(jq -r 'keys[]' <<< "$TARBALL_RUNNERS"); do
+              echo "mdhl-$version-$arch-linux.tar.gz"
+            done
+          } | sort > expected
+          (cd dist && ls -1) | sort > actual
+          if ! diff -u expected actual; then
+            echo "dist/ doesn't hold the expected release files (- missing, + unexpected)" >&2
+            exit 1
+          fi
+
+      - name: Write checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+
+  # Only this job can write to the repository, and only on a tag.
+  publish:
+    if: github.ref_type == 'tag'
+    needs: assemble
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: dist
+
+      # A tag with a pre-release suffix, like v0.2.0-rc.1, is published as a
+      # pre-release, so it isn't shown as the latest release.
+      - name: Publish release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          prerelease=
+          case $GITHUB_REF_NAME in *-*) prerelease=--prerelease ;; esac
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber -- *
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+                $prerelease -- *
+          fi
