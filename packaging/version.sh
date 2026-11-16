@@ -33,7 +33,8 @@ case ${1:-} in
                 ;;
         esac
         if [ "$1" = --rpm-release ]; then
-            release=$(sed -n 's/^Release: *//p' packaging/mdhl.spec | head -n1)
+            release=$(sed -n 's/^Release:[[:space:]]*//p' packaging/mdhl.spec |
+                head -n1 | sed 's/[[:space:]]*$//')
             release=${release%%%\{?dist\}}
             if [ -z "$release" ]; then
                 echo "no Release: found in packaging/mdhl.spec" >&2

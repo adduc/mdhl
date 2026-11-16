@@ -4,30 +4,44 @@ name: Release
 # attaches them to a GitHub release for that tag. Bump the version in
 # Cargo.toml and the spec file first; the build stops if they disagree.
 #
-# Every pull request runs the same builds and assembles the release files
-# without publishing, so a broken release is caught before tagging. Only the
-# upload to GitHub is left for the tag.
+# To try the release before tagging, run this workflow by hand from the
+# Actions tab: it builds and assembles every release file without
+# publishing. Only a tag uploads to GitHub.
 on:
   push:
     tags: ["v*"]
-  pull_request:
+  workflow_dispatch:
 
-# A newer push to a pull request cancels its older run. Tag runs are never
-# cancelled, so a release can't be left half published.
+# Runs are never cancelled, so a release can't be left half published.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
+# What a release is built for. The build matrices and the check of the
+# release files all come from these, so this is the only place to edit.
+env:
+  # Fedora releases to build an RPM for. The source RPM is the same for
+  # every release, so only the last one listed ships it.
+  FEDORA_RELEASES: "44 45"
+  # Architectures to build a static tarball for, and the runner that builds
+  # each one natively.
+  TARBALL_RUNNERS: '{"x86_64": "ubuntu-24.04", "aarch64": "ubuntu-24.04-arm"}'
+
 jobs:
-  # Packaging metadata that has to agree with the code. CI doesn't repeat
-  # these, since this workflow runs on every pull request.
+  # Packaging metadata that has to agree with the code. CI runs the same
+  # checks on every pull request; here the tag must match too.
   packaging:
     runs-on: ubuntu-24.04
+    outputs:
+      fedora: ${{ steps.matrix.outputs.fedora }}
+      tarball: ${{ steps.matrix.outputs.tarball }}
     steps:
       - uses: actions/checkout@v7
+      # check-license.sh reads the dependency tree with cargo.
+      - uses: dtolnay/rust-toolchain@stable
       # On a tag, the tag must match too.
       - name: Check the version
         run: packaging/check-version.sh ${TAG:+"$TAG"}
@@ -36,16 +50,19 @@ jobs:
       - name: Check the spec's License
         run: packaging/check-license.sh
 
+      # A matrix can't read env, so the lists above reach it as outputs.
+      - name: Build the matrices
+        id: matrix
+        run: |
+          echo "fedora=$(jq -cn '$ARGS.positional' --args $FEDORA_RELEASES)" >> "$GITHUB_OUTPUT"
+          echo "tarball=$(jq -c 'to_entries | map({arch: .key, runner: .value})' <<< "$TARBALL_RUNNERS")" >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
   rpm:
     needs: packaging
     strategy:
       matrix:
-        # Keep in step with the list in the assemble job. The source RPM is
-        # the same for every release, so only the newest one ships it.
-        include:
-          - fedora: 44
-          - fedora: 45
-            srpm: true
+        fedora: ${{ fromJSON(needs.packaging.outputs.fedora) }}
     runs-on: ubuntu-24.04
     container: fedora:${{ matrix.fedora }}
     steps:
@@ -64,11 +81,11 @@ jobs:
       # debuginfo repository behind them.
       - name: Collect RPMs
         env:
-          SRPM: ${{ matrix.srpm && 'true' || '' }}
+          FEDORA: ${{ matrix.fedora }}
         run: |
           mkdir dist
           dirs=(target/rpmbuild/RPMS)
-          if [ -n "$SRPM" ]; then
+          if [ "$FEDORA" = "${FEDORA_RELEASES##* }" ]; then
             dirs+=(target/rpmbuild/SRPMS)
           fi
           find "${dirs[@]}" -name '*.rpm' \
@@ -88,11 +105,7 @@ jobs:
     needs: packaging
     strategy:
       matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-24.04
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
+        include: ${{ fromJSON(needs.packaging.outputs.tarball) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -118,8 +131,8 @@ jobs:
           if-no-files-found: error
 
   # Gathers every build's output, checks it is exactly the set of files a
-  # release should carry, and adds SHA256SUMS. Runs on pull requests too, so
-  # all of the release except the upload is tested before tagging.
+  # release should carry, and adds SHA256SUMS. Runs on a manual run too, so
+  # all of the release except the upload can be tried before tagging.
   assemble:
     needs: [rpm, tarball]
     runs-on: ubuntu-24.04
@@ -136,11 +149,11 @@ jobs:
           version=$(packaging/version.sh)
           rpm=$(packaging/version.sh --rpm-release)
           {
-            for fedora in 44 45; do
+            for fedora in $FEDORA_RELEASES; do
               echo "mdhl-$rpm.fc$fedora.x86_64.rpm"
             done
-            echo "mdhl-$rpm.fc45.src.rpm"
-            for arch in x86_64 aarch64; do
+            echo "mdhl-$rpm.fc${FEDORA_RELEASES##* }.src.rpm"
+            for arch in $(jq -r 'keys[]' <<< "$TARBALL_RUNNERS"); do
               echo "mdhl-$version-$arch-linux.tar.gz"
             done
           } | sort > expected

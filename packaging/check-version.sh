@@ -15,9 +15,10 @@ spec_file=packaging/mdhl.spec
 cargo=$(packaging/version.sh)
 rpm=$(packaging/version.sh --rpm)
 rpm_release=$(packaging/version.sh --rpm-release)
-spec=$(sed -n 's/^Version: *//p' "$spec_file" | head -n1)
-# The first entry after %changelog ends in "- VERSION-RELEASE".
-changelog=$(sed -n '/^%changelog/,$ { /^\*/ { s/.* - *\([^ ]*\) *$/\1/p; q } }' "$spec_file")
+spec=$(sed -n 's/^Version:[[:space:]]*//p' "$spec_file" | head -n1 | sed 's/[[:space:]]*$//')
+# The first entry after %changelog ends in VERSION-RELEASE, with or without
+# a "- " before it; RPM accepts both.
+changelog=$(awk '/^%changelog/ { on = 1; next } on && /^\*/ { print $NF; exit }' "$spec_file")
 
 status=0
 fail() {

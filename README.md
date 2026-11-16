@@ -41,8 +41,9 @@ Each [release](https://github.com/adduc/mdhl/releases) has:
   on glibc and musl (Alpine) systems alike:
 
   ```sh
-  tar -xzf mdhl-*-$(uname -m)-linux.tar.gz
-  install -Dm755 mdhl-*-$(uname -m)-linux/mdhl ~/.local/bin/mdhl
+  v=X.Y.Z  # the release you downloaded
+  tar -xzf mdhl-$v-$(uname -m)-linux.tar.gz
+  install -Dm755 mdhl-$v-$(uname -m)-linux/mdhl ~/.local/bin/mdhl
   ```
 
 `SHA256SUMS` lists the checksums of every file (`sha256sum -c --ignore-missing SHA256SUMS`).
