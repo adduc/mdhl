@@ -198,9 +198,14 @@ cargo run -- sample.md --width 80
 The Release workflow builds the RPMs in Fedora 44 and 45 containers and
 the static tarballs for x86_64 and aarch64, then attaches them all, with a
 `SHA256SUMS` file, to a GitHub release for the tag. It stops if the tag
-doesn't match the version. Every pull request runs the same builds and
-assembles the release files, checksums included, stopping short of
-publishing.
+doesn't match the version.
+
+Pull requests only run the version and License checks, not the release
+builds. To try a release before tagging, run the Release workflow by hand
+(`gh workflow run release.yml`, or from the Actions tab): it builds and
+assembles every release file, checksums included, without publishing.
+GitHub only offers a manual run for workflows on the default branch, so
+this works once the workflow is on `main`.
 
 ## License
 
