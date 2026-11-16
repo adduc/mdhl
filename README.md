@@ -3,6 +3,47 @@
 Reads Markdown and prints an ANSI-color highlighted version to stdout.
 Parses with `pulldown-cmark`, renders to the terminal — no HTML, no pager.
 
+## Install
+
+Prebuilt packages for Linux are attached to each
+[release](https://github.com/adduc/mdhl/releases). The commands below
+install the latest, 0.1.0.
+
+### Fedora 44 and 45 (x86_64)
+
+dnf installs the RPM for your Fedora release straight from the release:
+
+```sh
+sudo dnf install https://github.com/adduc/mdhl/releases/download/v0.1.0/mdhl-0.1.0-1.fc$(rpm -E %fedora).x86_64.rpm
+```
+
+Remove it with `sudo dnf remove mdhl`.
+
+### Any other Linux (x86_64 and aarch64)
+
+The tarball holds a statically linked binary. It needs no libraries, so it
+runs on glibc and musl (Alpine) systems alike. This downloads the one for
+your architecture, checks it against the release's `SHA256SUMS`, and
+installs it to `~/.local/bin`:
+
+```sh
+v=0.1.0
+f=mdhl-$v-$(uname -m)-linux.tar.gz
+curl -fLO https://github.com/adduc/mdhl/releases/download/v$v/$f
+curl -fLO https://github.com/adduc/mdhl/releases/download/v$v/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+tar -xzf $f
+install -Dm755 mdhl-$v-$(uname -m)-linux/mdhl ~/.local/bin/mdhl
+```
+
+`~/.local/bin` must be on your `PATH`; check with `mdhl --version`. For a
+system-wide install, install the binary to `/usr/local/bin/mdhl` with
+`sudo` instead.
+
+### From source
+
+See [Build](#build): `make && make install`.
+
 ## Build
 
 Needs Rust 1.95 or newer.
@@ -25,30 +66,9 @@ sudo make install PREFIX=/usr/local
 
 `DESTDIR` is supported for staged installs when packaging.
 
-### Prebuilt binaries
+### Release tarball
 
-Each [release](https://github.com/adduc/mdhl/releases) has:
-
-- RPMs for Fedora 44 and 45 (x86_64). Install the one matching your
-  release with dnf:
-
-  ```sh
-  sudo dnf install ./mdhl-*.fc$(rpm -E %fedora).x86_64.rpm
-  ```
-
-- A tarball with a statically linked binary for any other Linux
-  distribution, for x86_64 and aarch64. It needs no libraries, so it runs
-  on glibc and musl (Alpine) systems alike:
-
-  ```sh
-  v=X.Y.Z  # the release you downloaded
-  tar -xzf mdhl-$v-$(uname -m)-linux.tar.gz
-  install -Dm755 mdhl-$v-$(uname -m)-linux/mdhl ~/.local/bin/mdhl
-  ```
-
-`SHA256SUMS` lists the checksums of every file (`sha256sum -c --ignore-missing SHA256SUMS`).
-
-To build the tarball yourself, add the musl target and run `make dist`. It
+To build the static release tarball yourself, add the musl target and run `make dist`. It
 lands in `target/dist/`. Set `RUST_TARGET` to build for another
 architecture, e.g. `RUST_TARGET=aarch64-unknown-linux-musl`.
 
@@ -233,7 +253,8 @@ cargo run -- sample.md --width 80
 1. Bump the version in `Cargo.toml` and in `Version:` of
    `packaging/mdhl.spec`, and add a `%changelog` entry to the spec for
    the new version. `packaging/check-version.sh` (also run on every pull
-   request) checks that all three agree.
+   request) checks that all three agree. Update the version in the
+   [Install](#install) commands too.
 
    For a pre-release, RPM writes the suffix with `~` instead of `-`: a
    Cargo version of `0.2.0-rc.1` is `Version: 0.2.0~rc.1` in the spec and
