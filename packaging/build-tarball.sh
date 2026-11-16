@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 name=mdhl
-version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)
+version=$(packaging/version.sh)
 target=${1:-$(uname -m)-unknown-linux-musl}
 arch=${target%%-*}
 dist=target/dist

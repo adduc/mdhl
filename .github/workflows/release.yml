@@ -4,18 +4,19 @@ name: Release
 # attaches them to a GitHub release for that tag. Bump the version in
 # Cargo.toml and the spec file first; the build stops if they disagree.
 #
-# Pull requests that touch the packaging run the same builds without
-# publishing, so a broken release is caught before tagging.
+# Every pull request runs the same builds and assembles the release files
+# without publishing, so a broken release is caught before tagging. Only the
+# upload to GitHub is left for the tag.
 on:
   push:
     tags: ["v*"]
   pull_request:
-    paths:
-      - .github/workflows/release.yml
-      - packaging/**
-      - Makefile
-      - Cargo.toml
-      - Cargo.lock
+
+# A newer push to a pull request cancels its older run. Tag runs are never
+# cancelled, so a release can't be left half published.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -34,6 +35,7 @@ jobs:
     needs: version
     strategy:
       matrix:
+        # Keep in step with the list in the assemble job.
         fedora: [44, 45]
     runs-on: ubuntu-24.04
     container: fedora:${{ matrix.fedora }}
@@ -100,28 +102,80 @@ jobs:
           path: target/dist/*.tar.gz
           if-no-files-found: error
 
+  # Gathers every build's output, checks it is exactly the set of files a
+  # release should carry, and adds SHA256SUMS. Runs on pull requests too, so
+  # all of the release except the upload is tested before tagging.
+  assemble:
+    needs: [rpm, tarball]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check the release files
+        run: |
+          version=$(packaging/version.sh)
+          rpm=$(packaging/version.sh --rpm)
+          release=$(sed -n 's/^Release: *//p' packaging/mdhl.spec | head -n1)
+          release=${release%%%\{?dist\}}
+          {
+            for fedora in 44 45; do
+              for arch in x86_64 src; do
+                echo "mdhl-$rpm-$release.fc$fedora.$arch.rpm"
+              done
+            done
+            for arch in x86_64 aarch64; do
+              echo "mdhl-$version-$arch-linux.tar.gz"
+            done
+          } | sort > expected
+          (cd dist && ls -1) | sort > actual
+          if ! diff -u expected actual; then
+            echo "dist/ doesn't hold the expected release files (- missing, + unexpected)" >&2
+            exit 1
+          fi
+
+      - name: Write checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+
+  # Only this job can write to the repository, and only on a tag.
   publish:
     if: github.ref_type == 'tag'
-    needs: [rpm, tarball]
+    needs: assemble
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
+          name: release
           path: dist
-          merge-multiple: true
 
+      # A tag with a pre-release suffix, like v0.2.0-rc.1, is published as a
+      # pre-release, so it isn't shown as the latest release.
       - name: Publish release
         working-directory: dist
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          sha256sum -- * > SHA256SUMS
-          cat SHA256SUMS
+          prerelease=
+          case $GITHUB_REF_NAME in *-*) prerelease=--prerelease ;; esac
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" --clobber -- *
           else
-            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes -- *
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+                $prerelease -- *
           fi

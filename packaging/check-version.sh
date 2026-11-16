@@ -1,26 +1,49 @@
 #!/usr/bin/env bash
-# Check that Cargo.toml and the spec file carry the same version. With a tag
+# Check that Cargo.toml and the spec file carry the same version, and that
+# the newest %changelog entry is for that version and release. With a tag
 # argument (e.g. v1.2.0), check that it matches too.
+#
+# A pre-release such as 0.2.0-rc.1 is written 0.2.0~rc.1 in the spec, since
+# RPM doesn't allow '-' in a version (see packaging/version.sh). The tag
+# keeps the Cargo form: v0.2.0-rc.1.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)
-spec=$(sed -n 's/^Version: *//p' packaging/mdhl.spec | head -n1)
+spec_file=packaging/mdhl.spec
+
+cargo=$(packaging/version.sh)
+rpm=$(packaging/version.sh --rpm)
+spec=$(sed -n 's/^Version: *//p' "$spec_file" | head -n1)
+release=$(sed -n 's/^Release: *//p' "$spec_file" | head -n1)
+release=${release%%%\{?dist\}}
+# The first entry after %changelog ends in "- VERSION-RELEASE".
+changelog=$(sed -n '/^%changelog/,$ { /^\*/ { s/.* - *\([^ ]*\) *$/\1/p; q } }' "$spec_file")
 
 status=0
-check() {
-    if [ "$2" != "$cargo" ]; then
-        echo "$1 has version '$2', but Cargo.toml has '$cargo'" >&2
-        status=1
-    fi
+fail() {
+    echo "$*" >&2
+    status=1
 }
-check packaging/mdhl.spec "$spec"
-if [ -n "${1:-}" ]; then
-    check "tag $1" "${1#v}"
+
+if [ "$spec" != "$rpm" ]; then
+    if [ "$rpm" != "$cargo" ]; then
+        fail "$spec_file has Version '$spec', but Cargo.toml has '$cargo'," \
+            "which RPM spells '$rpm'"
+    else
+        fail "$spec_file has Version '$spec', but Cargo.toml has '$cargo'"
+    fi
+fi
+if [ "$changelog" != "$rpm-$release" ]; then
+    fail "the newest %changelog entry in $spec_file is for" \
+        "'${changelog:-nothing}', but the package is '$rpm-$release';" \
+        "add an entry for this release"
+fi
+if [ -n "${1:-}" ] && [ "${1#v}" != "$cargo" ]; then
+    fail "tag $1 doesn't match Cargo.toml's version '$cargo'; expected v$cargo"
 fi
 
 if [ $status -eq 0 ]; then
-    echo "version $cargo is consistent"
+    echo "version $cargo (RPM $rpm-$release) is consistent"
 fi
 exit $status

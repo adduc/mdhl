@@ -9,7 +9,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 name=mdhl
-version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)
+# The spec's %{version}, which names the tarballs and their top directory.
+version=$(packaging/version.sh --rpm)
 top=$PWD/target/rpmbuild
 sources=$top/SOURCES
 

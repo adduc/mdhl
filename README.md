@@ -179,8 +179,14 @@ cargo run -- sample.md --width 80
 ## Releasing
 
 1. Bump the version in `Cargo.toml` and in `Version:` of
-   `packaging/mdhl.spec`, and add a `%changelog` entry to the spec.
-   `packaging/check-version.sh` (also run in CI) checks that they agree.
+   `packaging/mdhl.spec`, and add a `%changelog` entry to the spec for
+   the new version. `packaging/check-version.sh` (also run in CI) checks
+   that all three agree.
+
+   For a pre-release, RPM writes the suffix with `~` instead of `-`: a
+   Cargo version of `0.2.0-rc.1` is `Version: 0.2.0~rc.1` in the spec and
+   in its changelog entry, and the tag is `v0.2.0-rc.1`. It's published as
+   a GitHub pre-release.
 2. Merge to `main`, then tag and push:
 
    ```sh
@@ -191,8 +197,9 @@ cargo run -- sample.md --width 80
 The Release workflow builds the RPMs in Fedora 44 and 45 containers and
 the static tarballs for x86_64 and aarch64, then attaches them all, with a
 `SHA256SUMS` file, to a GitHub release for the tag. It stops if the tag
-doesn't match the version. Pull requests that touch the packaging run the
-same builds without publishing.
+doesn't match the version. Every pull request runs the same builds and
+assembles the release files, checksums included, stopping short of
+publishing.
 
 ## License
 
